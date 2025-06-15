@@ -10,7 +10,6 @@ import (
 	"encoding/csv"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -154,47 +153,43 @@ func runBacktestMode(cfg *models.Config, dataPath string) {
 	}
 	defer file.Close()
 
-	reader := csv.NewReader(file)
-
-	// --- 读取并跳过CSV表头 ---
-	if _, err := reader.Read(); err != nil {
-		log.Fatalf("无法读取CSV表头: %v", err)
-	}
-
-	// --- 读取第一行真实数据以设置初始价格 ---
-	initialRecord, err := reader.Read()
-	if err == io.EOF {
-		log.Fatal("历史数据文件为空（只有表头）。")
-	}
+	// --- 重构数据读取以捕获时间 ---
+	records, err := csv.NewReader(file).ReadAll()
 	if err != nil {
-		log.Fatalf("读取初始数据失败: %v", err)
+		log.Fatalf("无法读取所有CSV记录: %v", err)
 	}
-	initialHigh, errH := strconv.ParseFloat(initialRecord[2], 64)  // [2] is high
-	initialLow, errL := strconv.ParseFloat(initialRecord[3], 64)   // [3] is low
-	initialClose, errC := strconv.ParseFloat(initialRecord[4], 64) // [4] is close
+	if len(records) <= 1 { // 至少需要表头和一行数据
+		log.Fatal("历史数据文件为空或只有表头。")
+	}
+
+	// 移除表头
+	records = records[1:]
+
+	// 解析开始和结束时间
+	startTimeMs, _ := strconv.ParseInt(records[0][0], 10, 64)
+	endTimeMs, _ := strconv.ParseInt(records[len(records)-1][0], 10, 64)
+	startTime := time.UnixMilli(startTimeMs)
+	endTime := time.UnixMilli(endTimeMs)
+
+	// --- 使用第一行数据进行初始化 ---
+	initialRecord := records[0]
+	initialHigh, errH := strconv.ParseFloat(initialRecord[2], 64)
+	initialLow, errL := strconv.ParseFloat(initialRecord[3], 64)
+	initialClose, errC := strconv.ParseFloat(initialRecord[4], 64)
 	if errH != nil || errL != nil || errC != nil {
 		log.Fatalf("无法解析初始价格: high=%v, low=%v, close=%v", errH, errL, errC)
 	}
 
-	// --- 使用初始价格初始化 ---
-	backtestExchange.SetPrice(initialHigh, initialLow, initialClose) // 必须先设置交易所价格
-	gridBot.SetCurrentPrice(initialClose)                            // 机器人也需要知道初始价格
+	backtestExchange.SetPrice(initialHigh, initialLow, initialClose)
+	gridBot.SetCurrentPrice(initialClose)
 	if err := gridBot.StartForBacktest(); err != nil {
 		log.Fatalf("回测机器人初始化失败: %v", err)
 	}
 	log.Printf("使用初始价格 %.2f 完成机器人初始化。\n", initialClose)
 
+	// --- 循环处理所有数据点 ---
 	log.Println("开始回测...")
-	for {
-		record, err := reader.Read()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			log.Fatalf("读取历史数据失败: %v", err)
-		}
-
-		// 假设CSV格式为：timestamp,open,high,low,close,volume
+	for _, record := range records {
 		high, errH := strconv.ParseFloat(record[2], 64)
 		low, errL := strconv.ParseFloat(record[3], 64)
 		close, errC := strconv.ParseFloat(record[4], 64)
@@ -202,14 +197,12 @@ func runBacktestMode(cfg *models.Config, dataPath string) {
 			log.Printf("无法解析K线价格，跳过此条记录: high=%v, low=%v, close=%v", errH, errL, errC)
 			continue
 		}
-
-		// 将新价格推送给模拟交易所和机器人
-		backtestExchange.SetPrice(high, low, close) // 推送价格到模拟交易所，触发订单成交
-		gridBot.ProcessBacktestTick()               // 手动执行策略，检查已成交订单
+		backtestExchange.SetPrice(high, low, close)
+		gridBot.ProcessBacktestTick()
 	}
 
 	log.Println("回测结束。")
 
 	// --- 生成并打印回测报告 ---
-	reporter.GenerateReport(backtestExchange, dataPath)
+	reporter.GenerateReport(backtestExchange, dataPath, startTime, endTime)
 }

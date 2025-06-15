@@ -5,6 +5,7 @@ import (
 	"encoding/csv"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/adshao/go-binance/v2"
@@ -32,6 +33,13 @@ func (d *KlineDownloader) DownloadKlines(symbol, filePath string, startTime, end
 	}
 
 	fmt.Printf("开始下载 %s 从 %s 到 %s 的K线数据...\n", symbol, startTime.Format("2006-01-02"), endTime.Format("2006-01-02"))
+
+	// --- 修复: 在创建文件前确保目录存在 ---
+	dir := filepath.Dir(filePath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("无法创建目录 %s: %v", dir, err)
+	}
+	// --- 修复结束 ---
 
 	file, err := os.Create(filePath)
 	if err != nil {

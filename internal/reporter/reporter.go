@@ -4,6 +4,7 @@ import (
 	"binance-grid-bot-go/internal/exchange"
 	"log"
 	"math"
+	"time"
 )
 
 // Metrics 存储计算出的所有回测性能指标
@@ -22,15 +23,20 @@ type Metrics struct {
 	EndingCash       float64 // 新增：期末现金
 	EndingAssetValue float64 // 新增：期末持仓市值
 	TotalAssetQty    float64 // 新增：持有资产的总数量
+	StartTime        time.Time
+	EndTime          time.Time
 }
 
 // GenerateReport 根据回测交易所的状态计算并打印性能报告
-func GenerateReport(backtestExchange *exchange.BacktestExchange, dataPath string) {
+func GenerateReport(backtestExchange *exchange.BacktestExchange, dataPath string, startTime, endTime time.Time) {
 	metrics, symbol := calculateMetrics(backtestExchange)
+	metrics.StartTime = startTime
+	metrics.EndTime = endTime
 
 	log.Println("========== 回测结果报告 ==========")
 	log.Printf("数据文件:         %s", dataPath)
 	log.Printf("交易对:           %s", symbol)
+	log.Printf("回测周期:         %s 到 %s", metrics.StartTime.Format("2006-01-02 15:04"), metrics.EndTime.Format("2006-01-02 15:04"))
 	log.Printf("------------------------------------")
 	log.Printf("初始资金:         %.2f USDT", metrics.InitialBalance)
 	log.Printf("最终资金:         %.2f USDT", metrics.FinalBalance)
