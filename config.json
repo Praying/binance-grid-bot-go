@@ -1,11 +1,11 @@
 {
   "api_key": "your_binance_api_key_here",
   "secret_key": "your_binance_secret_key_here",
+  "is_testnet": true,
   "symbol": "BTCUSDT",
   "grid_spacing": 0.005,
   "grid_value": 7.0,
   "leverage": 10,
-  "return_rate": 0.2,
-  "base_url": "https://fapi.binance.com",
-  "ws_base_url": "wss://fstream.binance.com"
-}
+  "grid_count": 20,
+  "return_rate": 0.2
+ }
