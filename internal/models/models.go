@@ -1,0 +1,104 @@
+package models
+
+import "time"
+
+// Config 结构体定义了机器人的所有配置参数
+type Config struct {
+	APIKey      string  `json:"api_key"`
+	SecretKey   string  `json:"secret_key"`
+	IsTestnet   bool    `json:"is_testnet"`   // 是否使用测试网
+	Symbol      string  `json:"symbol"`       // 交易对，如 "BTCUSDT"
+	GridSpacing float64 `json:"grid_spacing"` // 网格间距比例
+	GridValue   float64 `json:"grid_value"`   // 每个网格的交易价值 (USDT)
+	Leverage    int     `json:"leverage"`     // 杠杆倍数
+	GridCount   int     `json:"grid_count"`   // 网格数量（对）
+	ReturnRate  float64 `json:"return_rate"`  // 预期回归价格比例
+	BaseURL     string  `json:"base_url"`     // REST API基础地址 (将由程序动态设置)
+	WSBaseURL   string  `json:"ws_base_url"`  // WebSocket基础地址 (将由程序动态设置)
+}
+
+// AccountInfo 定义了币安账户信息
+type AccountInfo struct {
+	TotalWalletBalance string `json:"totalWalletBalance"`
+	AvailableBalance   string `json:"availableBalance"`
+	Assets             []struct {
+		Asset                  string `json:"asset"`
+		WalletBalance          string `json:"walletBalance"`
+		UnrealizedProfit       string `json:"unrealizedProfit"`
+		MarginBalance          string `json:"marginBalance"`
+		MaintMargin            string `json:"maintMargin"`
+		InitialMargin          string `json:"initialMargin"`
+		PositionInitialMargin  string `json:"positionInitialMargin"`
+		OpenOrderInitialMargin string `json:"openOrderInitialMargin"`
+		MaxWithdrawAmount      string `json:"maxWithdrawAmount"`
+	} `json:"assets"`
+}
+
+// Position 定义了持仓信息
+type Position struct {
+	Symbol           string `json:"symbol"`
+	PositionAmt      string `json:"positionAmt"`
+	EntryPrice       string `json:"entryPrice"`
+	MarkPrice        string `json:"markPrice"`
+	UnRealizedProfit string `json:"unRealizedProfit"`
+	LiquidationPrice string `json:"liquidationPrice"`
+	Leverage         string `json:"leverage"`
+	MaxNotionalValue string `json:"maxNotionalValue"`
+	MarginType       string `json:"marginType"`
+	IsolatedMargin   string `json:"isolatedMargin"`
+	IsAutoAddMargin  string `json:"isAutoAddMargin"`
+	PositionSide     string `json:"positionSide"`
+	Notional         string `json:"notional"`
+	IsolatedWallet   string `json:"isolatedWallet"`
+	UpdateTime       int64  `json:"updateTime"`
+}
+
+// Order 定义了订单信息
+type Order struct {
+	Symbol        string `json:"symbol"`
+	OrderId       int64  `json:"orderId"`
+	ClientOrderId string `json:"clientOrderId"`
+	Price         string `json:"price"`
+	OrigQty       string `json:"origQty"`
+	ExecutedQty   string `json:"executedQty"`
+	CumQuote      string `json:"cumQuote"`
+	Status        string `json:"status"`
+	TimeInForce   string `json:"timeInForce"`
+	Type          string `json:"type"`
+	Side          string `json:"side"`
+	StopPrice     string `json:"stopPrice"`
+	IcebergQty    string `json:"icebergQty"`
+	Time          int64  `json:"time"`
+	UpdateTime    int64  `json:"updateTime"`
+	IsWorking     bool   `json:"isWorking"`
+	WorkingType   string `json:"workingType"`
+	OrigType      string `json:"origType"`
+	PositionSide  string `json:"positionSide"`
+	ActivatePrice string `json:"activatePrice"`
+	PriceRate     string `json:"priceRate"`
+	ReduceOnly    bool   `json:"reduceOnly"`
+	ClosePosition bool   `json:"closePosition"`
+	PriceProtect  bool   `json:"priceProtect"`
+}
+
+// GridLevel 代表网格中的一个价格档位
+type GridLevel struct {
+	Price           float64 `json:"price"`
+	Quantity        float64 `json:"quantity"`
+	Side            string  `json:"side"`
+	IsActive        bool    `json:"is_active"`
+	OrderID         int64   `json:"order_id"`
+	PairID          int     `json:"pair_id"`                     // 用于配对买单和卖单
+	PairedSellPrice float64 `json:"paired_sell_price,omitempty"` // 仅在买单中使用，记录其对应的卖出价
+}
+
+// CompletedTrade 记录一笔完成的交易（买入和卖出）
+type CompletedTrade struct {
+	Symbol     string
+	Quantity   float64
+	EntryTime  time.Time
+	ExitTime   time.Time
+	EntryPrice float64
+	ExitPrice  float64 // 新增：记录卖出价格
+	Profit     float64
+}
