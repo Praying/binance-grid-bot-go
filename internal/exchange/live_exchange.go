@@ -211,3 +211,43 @@ func (e *LiveExchange) GetOrderStatus(symbol string, orderID int64) (*models.Ord
 	err = json.Unmarshal(data, &order)
 	return &order, err
 }
+
+func (e *LiveExchange) GetCurrentTime() time.Time {
+	return time.Now()
+}
+
+// GetAccountState 获取实盘账户的状态，包括总持仓价值和账户总权益
+func (e *LiveExchange) GetAccountState(symbol string) (positionValue float64, accountEquity float64, err error) {
+	// 1. 获取持仓信息以得到持仓名义价值
+	positions, err := e.GetPositions(symbol)
+	if err != nil {
+		return 0, 0, fmt.Errorf("获取持仓信息失败: %v", err)
+	}
+
+	// 在我们的单交易对场景下，我们只关心一个持仓
+	if len(positions) > 0 {
+		// 注意：'notional' 通常是带符号的，正数代表多头，负数代表空头。我们取绝对值。
+		notionalValue, err := strconv.ParseFloat(positions[0].Notional, 64)
+		if err != nil {
+			return 0, 0, fmt.Errorf("解析持仓名义价值失败: %v", err)
+		}
+		if notionalValue < 0 {
+			notionalValue = -notionalValue
+		}
+		positionValue = notionalValue
+	}
+
+	// 2. 获取账户信息以得到总钱包余额
+	accountInfo, err := e.GetAccountInfo()
+	if err != nil {
+		return 0, 0, fmt.Errorf("获取账户信息失败: %v", err)
+	}
+
+	totalBalance, err := strconv.ParseFloat(accountInfo.TotalWalletBalance, 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("解析总钱包余额失败: %v", err)
+	}
+	accountEquity = totalBalance
+
+	return positionValue, accountEquity, nil
+}

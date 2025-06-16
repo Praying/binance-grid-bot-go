@@ -173,6 +173,8 @@ func runBacktestMode(cfg *models.Config, dataPath string) {
 
 	// --- 使用第一行数据进行初始化 ---
 	initialRecord := records[0]
+	initialTimeMs, _ := strconv.ParseInt(initialRecord[0], 10, 64)
+	initialTime := time.UnixMilli(initialTimeMs)
 	initialHigh, errH := strconv.ParseFloat(initialRecord[2], 64)
 	initialLow, errL := strconv.ParseFloat(initialRecord[3], 64)
 	initialClose, errC := strconv.ParseFloat(initialRecord[4], 64)
@@ -180,7 +182,7 @@ func runBacktestMode(cfg *models.Config, dataPath string) {
 		log.Fatalf("无法解析初始价格: high=%v, low=%v, close=%v", errH, errL, errC)
 	}
 
-	backtestExchange.SetPrice(initialHigh, initialLow, initialClose)
+	backtestExchange.SetPrice(initialHigh, initialLow, initialClose, initialTime)
 	gridBot.SetCurrentPrice(initialClose)
 	if err := gridBot.StartForBacktest(); err != nil {
 		log.Fatalf("回测机器人初始化失败: %v", err)
@@ -190,14 +192,22 @@ func runBacktestMode(cfg *models.Config, dataPath string) {
 	// --- 循环处理所有数据点 ---
 	log.Println("开始回测...")
 	for _, record := range records {
+		// 在每次循环开始时检查是否已爆仓
+		if backtestExchange.IsLiquidated() {
+			log.Println("检测到爆仓，提前终止回测循环。")
+			break
+		}
+
+		timestampMs, errT := strconv.ParseInt(record[0], 10, 64)
 		high, errH := strconv.ParseFloat(record[2], 64)
 		low, errL := strconv.ParseFloat(record[3], 64)
-		close, errC := strconv.ParseFloat(record[4], 64)
-		if errH != nil || errL != nil || errC != nil {
-			log.Printf("无法解析K线价格，跳过此条记录: high=%v, low=%v, close=%v", errH, errL, errC)
+		closePrice, errC := strconv.ParseFloat(record[4], 64)
+		if errT != nil || errH != nil || errL != nil || errC != nil {
+			log.Printf("无法解析K线数据，跳过此条记录: %v", record)
 			continue
 		}
-		backtestExchange.SetPrice(high, low, close)
+		timestamp := time.UnixMilli(timestampMs)
+		backtestExchange.SetPrice(high, low, closePrice, timestamp)
 		gridBot.ProcessBacktestTick()
 	}
 

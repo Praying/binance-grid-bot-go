@@ -1,6 +1,9 @@
 package exchange
 
-import "binance-grid-bot-go/internal/models"
+import (
+	"binance-grid-bot-go/internal/models"
+	"time"
+)
 
 // Exchange 定义了所有交易所实现必须提供的通用方法。
 // 这使得交易机器人可以在真实交易和回测之间轻松切换。
@@ -13,4 +16,7 @@ type Exchange interface {
 	GetAccountInfo() (*models.AccountInfo, error)
 	CancelAllOpenOrders(symbol string) error
 	GetOrderStatus(symbol string, orderID int64) (*models.Order, error)
+	GetCurrentTime() time.Time
+	// GetAccountState 获取账户状态，包括总持仓价值和账户总权益
+	GetAccountState(symbol string) (positionValue float64, accountEquity float64, err error)
 }

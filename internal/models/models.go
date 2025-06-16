@@ -4,17 +4,18 @@ import "time"
 
 // Config 结构体定义了机器人的所有配置参数
 type Config struct {
-	APIKey      string  `json:"api_key"`
-	SecretKey   string  `json:"secret_key"`
-	IsTestnet   bool    `json:"is_testnet"`   // 是否使用测试网
-	Symbol      string  `json:"symbol"`       // 交易对，如 "BTCUSDT"
-	GridSpacing float64 `json:"grid_spacing"` // 网格间距比例
-	GridValue   float64 `json:"grid_value"`   // 每个网格的交易价值 (USDT)
-	Leverage    int     `json:"leverage"`     // 杠杆倍数
-	GridCount   int     `json:"grid_count"`   // 网格数量（对）
-	ReturnRate  float64 `json:"return_rate"`  // 预期回归价格比例
-	BaseURL     string  `json:"base_url"`     // REST API基础地址 (将由程序动态设置)
-	WSBaseURL   string  `json:"ws_base_url"`  // WebSocket基础地址 (将由程序动态设置)
+	APIKey              string  `json:"api_key"`
+	SecretKey           string  `json:"secret_key"`
+	IsTestnet           bool    `json:"is_testnet"`            // 是否使用测试网
+	Symbol              string  `json:"symbol"`                // 交易对，如 "BTCUSDT"
+	GridSpacing         float64 `json:"grid_spacing"`          // 网格间距比例
+	GridValue           float64 `json:"grid_value"`            // 每个网格的交易价值 (USDT)
+	Leverage            int     `json:"leverage"`              // 杠杆倍数
+	GridCount           int     `json:"grid_count"`            // 网格数量（对）
+	ReturnRate          float64 `json:"return_rate"`           // 预期回归价格比例
+	WalletExposureLimit float64 `json:"wallet_exposure_limit"` // 新增：钱包风险暴露上限
+	BaseURL             string  `json:"base_url"`              // REST API基础地址 (将由程序动态设置)
+	WSBaseURL           string  `json:"ws_base_url"`           // WebSocket基础地址 (将由程序动态设置)
 }
 
 // AccountInfo 定义了币安账户信息
