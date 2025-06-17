@@ -17,6 +17,10 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+const (
+	ActiveOrdersCount = 3 // 在价格两侧各挂的订单数量
+)
+
 // GridTradingBot 是网格交易机器人的核心结构
 type GridTradingBot struct {
 	config       *models.Config
@@ -24,18 +28,18 @@ type GridTradingBot struct {
 	wsConn       *websocket.Conn
 	gridLevels   []models.GridLevel // 现在代表活动的挂单
 	currentPrice float64
-	returnPrice  float64
 	isRunning    bool
 	IsBacktest   bool      // 新增：用于区分实盘和回测模式
 	currentTime  time.Time // 新增：用于存储当前时间，主要用于回测日志
 	mutex        sync.RWMutex
 	stopChannel  chan bool
 	logger       *log.Logger
+	symbolInfo   *models.SymbolInfo // 缓存交易规则
 }
 
 // NewGridTradingBot 创建一个新的网格交易机器人实例
 func NewGridTradingBot(config *models.Config, ex exchange.Exchange, isBacktest bool) *GridTradingBot {
-	return &GridTradingBot{
+	bot := &GridTradingBot{
 		config:      config,
 		exchange:    ex,
 		gridLevels:  make([]models.GridLevel, 0),
@@ -44,9 +48,19 @@ func NewGridTradingBot(config *models.Config, ex exchange.Exchange, isBacktest b
 		stopChannel: make(chan bool),
 		logger:      log.New(log.Writer(), "[GridBot] ", log.LstdFlags),
 	}
+
+	// 获取并缓存交易规则
+	symbolInfo, err := ex.GetSymbolInfo(config.Symbol)
+	if err != nil {
+		bot.logger.Fatalf("无法获取交易对 %s 的规则: %v", config.Symbol, err)
+	}
+	bot.symbolInfo = symbolInfo
+	bot.logger.Printf("成功获取并缓存了 %s 的交易规则。", config.Symbol)
+
+	return bot
 }
 
-// initializeGrid 实现新的建仓和挂单策略
+// initializeGrid 实现新的动态挂单策略
 func (b *GridTradingBot) initializeGrid() error {
 	currentPrice, err := b.exchange.GetPrice(b.config.Symbol)
 	if err != nil {
@@ -55,14 +69,56 @@ func (b *GridTradingBot) initializeGrid() error {
 
 	b.mutex.Lock()
 	b.currentPrice = currentPrice
-	b.returnPrice = currentPrice * (1 + b.config.ReturnRate)
 	b.gridLevels = make([]models.GridLevel, 0)
 	b.mutex.Unlock()
 
-	b.logger.Printf("当前价格: %.8f, 回归价格: %.8f", b.currentPrice, b.returnPrice)
+	b.logger.Printf("初始化网格，当前价格: %.4f", currentPrice)
 
 	if err := b.exchange.SetLeverage(b.config.Symbol, b.config.Leverage); err != nil {
 		b.logger.Printf("设置杠杆失败: %v", err)
+	}
+
+	// 初始建仓逻辑（仅在全新启动时执行）
+	// 1. 计算回归价格和理论网格数
+	returnPrice := currentPrice * (1 + b.config.ReturnRate)
+	priceDiff := returnPrice - currentPrice
+	priceStep := currentPrice * b.config.GridSpacing
+
+	var conceptualGridCount float64
+	if priceStep > 0 {
+		conceptualGridCount = math.Floor(priceDiff / priceStep)
+	}
+
+	b.logger.Printf("计算初始仓位：当前价: %.4f, 回归率: %.2f, 回归价格上限: %.4f", currentPrice, b.config.ReturnRate, returnPrice)
+
+	if conceptualGridCount > 0 {
+		// 2. 计算总投资额
+		initialInvestmentUSDT := conceptualGridCount * b.config.GridValue
+		b.logger.Printf("理论网格数: %.0f, 单网格价值: %.2f USDT", conceptualGridCount, b.config.GridValue)
+		b.logger.Printf("计算得出初始投资总额: %.2f USDT, 准备市价买入底仓...", initialInvestmentUSDT)
+
+		// 3. 执行市价买入
+		quantity := initialInvestmentUSDT / currentPrice
+		var stepSize string
+		for _, f := range b.symbolInfo.Filters {
+			if f.FilterType == "LOT_SIZE" {
+				stepSize = f.StepSize
+			}
+		}
+		adjustedQuantity := adjustValueToStep(quantity, stepSize)
+
+		if !b.isWithinExposureLimit(adjustedQuantity) {
+			b.logger.Printf("初始建仓被阻止：钱包风险暴露将超过限制。")
+		} else {
+			order, err := b.exchange.PlaceOrder(b.config.Symbol, "BUY", "MARKET", adjustedQuantity, 0) // 市价单价格为0
+			if err != nil {
+				b.logger.Printf("初始市价买入失败: %v", err)
+			} else {
+				b.logger.Printf("成功建立初始仓位: 市价买入 %.5f %s, 订单ID: %d", adjustedQuantity, b.config.Symbol, order.OrderId)
+			}
+		}
+	} else {
+		b.logger.Println("回归价格低于或等于当前价格，跳过初始建仓。")
 	}
 
 	b.logger.Println("正在取消所有现有挂单以确保一个干净的开始...")
@@ -70,49 +126,42 @@ func (b *GridTradingBot) initializeGrid() error {
 		b.logger.Printf("取消订单失败，可能需要手动检查: %v", err)
 	}
 
-	// 1. 计算网格数量和总购买量
 	gridSpacing := b.config.GridSpacing
-	numGrids := int(math.Floor(math.Log(b.returnPrice/b.currentPrice) / math.Log(1+gridSpacing)))
-	if numGrids <= 0 {
-		numGrids = 1
-		b.logger.Println("计算出的网格数小于等于0, 将至少创建1个网格。")
+
+	// 以当前价格为中心，在两侧挂单
+	for i := 1; i <= ActiveOrdersCount; i++ {
+		// 挂卖单
+		sellPrice := currentPrice * (1 + float64(i)*gridSpacing)
+		go b.placeNewOrder("SELL", sellPrice)
+
+		// 挂买单
+		buyPrice := currentPrice * (1 - float64(i)*gridSpacing)
+		go b.placeNewOrder("BUY", buyPrice)
 	}
 
-	totalQuantity, estimatedUSDT := b.calculateInitialGrid(b.currentPrice, b.returnPrice, numGrids)
-
-	b.logger.Printf("计算出当前价格到回归价格之间有 %d 个网格，准备一次性市价买入总数量: %.5f (预计花费: %.2f USDT)", numGrids, totalQuantity, estimatedUSDT)
-
-	// 2. 一次性市价买入 (增加风险暴露检查)
-	if !b.isWithinExposureLimit(totalQuantity) {
-		return fmt.Errorf("初始建仓失败：钱包风险暴露将超过限制")
-	}
-	marketOrder, err := b.exchange.PlaceOrder(b.config.Symbol, "BUY", "MARKET", totalQuantity, 0, "LONG")
-	if err != nil {
-		return fmt.Errorf("初始市价买入失败: %v", err)
-	}
-	b.logger.Printf("初始市价买入成功, 订单ID: %d", marketOrder.OrderId)
-
-	// 3. 在对应位置挂空单
-	for i := 0; i < numGrids; i++ {
-		sellPrice := b.currentPrice * math.Pow(1+gridSpacing, float64(i+1))
-		// 使用 go b.placeNewOrder(...) 以允许它们并发执行
-		go b.placeNewOrder("SELL", "LONG", sellPrice)
-	}
-
-	// 4. 在当前价格下方挂一个多单
-	buyPrice := b.currentPrice * (1 - gridSpacing)
-	go b.placeNewOrder("BUY", "LONG", buyPrice)
-
-	b.logger.Println("新的初始化策略执行完毕。")
+	b.logger.Println("初始化挂单完成。")
 	return nil
 }
 
 // placeNewOrder 是一个辅助函数，用于下单并将其添加到网格级别
-func (b *GridTradingBot) placeNewOrder(side, positionSide string, price float64) {
+func (b *GridTradingBot) placeNewOrder(side string, price float64) {
 	b.mutex.Lock()
 	defer b.mutex.Unlock()
 
-	quantity := b.calculateQuantity(price)
+	// 获取价格和数量的精度规则
+	var tickSize, stepSize string
+	for _, f := range b.symbolInfo.Filters {
+		if f.FilterType == "PRICE_FILTER" {
+			tickSize = f.TickSize
+		} else if f.FilterType == "LOT_SIZE" {
+			stepSize = f.StepSize
+		}
+	}
+
+	// 调整价格和数量以符合精度要求
+	adjustedPrice := adjustValueToStep(price, tickSize)
+	quantity := b.calculateQuantity(adjustedPrice)
+	adjustedQuantity := adjustValueToStep(quantity, stepSize)
 
 	// 在下买单前检查钱包风险暴露
 	if side == "BUY" {
@@ -122,20 +171,20 @@ func (b *GridTradingBot) placeNewOrder(side, positionSide string, price float64)
 		}
 	}
 
-	order, err := b.exchange.PlaceOrder(b.config.Symbol, side, "LIMIT", quantity, price, positionSide)
+	order, err := b.exchange.PlaceOrder(b.config.Symbol, side, "LIMIT", adjustedQuantity, adjustedPrice)
 	if err != nil {
-		b.logger.Printf("下 %s 单失败，价格 %.4f: %v", side, price, err)
+		b.logger.Printf("下 %s 单失败，价格 %.4f: %v", side, adjustedPrice, err)
 		return
 	}
 
 	b.gridLevels = append(b.gridLevels, models.GridLevel{
-		Price:    price,
-		Quantity: quantity,
+		Price:    adjustedPrice,
+		Quantity: adjustedQuantity,
 		Side:     side,
 		IsActive: true, // All orders in this list are considered active
 		OrderID:  order.OrderId,
 	})
-	b.logger.Printf("成功下 %s 单: ID %d, 价格 %.4f, 数量 %.5f", side, order.OrderId, price, quantity)
+	b.logger.Printf("成功下 %s 单: ID %d, 价格 %.4f, 数量 %.5f", side, order.OrderId, adjustedPrice, adjustedQuantity)
 }
 
 // calculateQuantity 计算订单数量
@@ -150,149 +199,181 @@ func (b *GridTradingBot) calculateQuantity(price float64) float64 {
 	return math.Floor(quantity*100000) / 100000
 }
 
-// checkOrderStatusAndHandleFills 检查活动订单的状态并处理已成交的订单。
-// 这个函数现在是原子的：它会锁定机器人状态，执行所有检查、移除、下单和添加操作，然后解锁。
-// 这避免了复杂的跨函数锁管理和潜在的死锁。
+// checkOrderStatusAndHandleFills 检查并处理订单，维持动态网格
 func (b *GridTradingBot) checkOrderStatusAndHandleFills() {
+	// 复制一份订单列表以在无锁的情况下进行网络请求
+	b.mutex.RLock()
+	if len(b.gridLevels) == 0 {
+		b.mutex.RUnlock()
+		b.logger.Println("无活动订单，检查是否需要重新初始化...")
+		return
+	}
+	gridsToCheck := make([]models.GridLevel, len(b.gridLevels))
+	copy(gridsToCheck, b.gridLevels)
+	b.mutex.RUnlock()
+
+	type filledOrderInfo struct {
+		grid   models.GridLevel
+		status *models.Order
+	}
+	filledOrders := make(chan filledOrderInfo, len(gridsToCheck))
+	invalidOrderIDs := make(chan int64, len(gridsToCheck))
+
+	var wg sync.WaitGroup
+	for _, grid := range gridsToCheck {
+		wg.Add(1)
+		go func(g models.GridLevel) {
+			defer wg.Done()
+			orderStatus, err := b.exchange.GetOrderStatus(b.config.Symbol, g.OrderID)
+			if err != nil {
+				if b.IsBacktest && strings.Contains(err.Error(), "未找到") {
+					orderStatus = &models.Order{Status: "FILLED", Price: fmt.Sprintf("%.8f", g.Price)}
+				} else {
+					b.logger.Printf("获取订单 %d 状态失败: %v", g.OrderID, err)
+					return
+				}
+			}
+
+			switch orderStatus.Status {
+			case "FILLED":
+				filledOrders <- filledOrderInfo{grid: g, status: orderStatus}
+			case "CANCELED", "EXPIRED", "REJECTED":
+				b.logger.Printf("订单 %d (%s) 已失效 (状态: %s)。准备将其从活动列表中移除。", g.OrderID, g.Side, orderStatus.Status)
+				invalidOrderIDs <- g.OrderID
+			}
+		}(grid)
+	}
+
+	wg.Wait()
+	close(filledOrders)
+	close(invalidOrderIDs)
+
+	// 检查是否有任何订单状态发生了变化
+	if len(filledOrders) == 0 && len(invalidOrderIDs) == 0 {
+		return // 没有任何成交或失效的订单，直接返回，不做任何操作
+	}
+
+	// 现在，一次性获取写锁来处理所有状态变更
 	b.mutex.Lock()
 	defer b.mutex.Unlock()
 
-	if len(b.gridLevels) == 0 {
-		return
-	}
+	// 只要有任何订单成交或失效，就认为网格需要重新评估
+	didStateChange := false
 
-	i := 0
-	for i < len(b.gridLevels) {
-		grid := b.gridLevels[i]
-
-		orderStatus, err := b.exchange.GetOrderStatus(b.config.Symbol, grid.OrderID)
-		// 核心逻辑修正：正确处理订单状态
-		// 当交易所返回“未找到”时，对于回测而言，这等同于订单已成交并从活动列表移除。
-		// 因此，我们手动创建一个状态为 FILLED 的订单对象，以触发后续的挂单逻辑。
-		// 对于其他类型的错误，我们才记录并跳过。
-		if err != nil {
-			if strings.Contains(err.Error(), "未找到") {
-				orderStatus = &models.Order{Status: "FILLED", Price: fmt.Sprintf("%.8f", grid.Price)}
-			} else {
-				b.logger.Printf("获取订单 %d 状态失败: %v", grid.OrderID, err)
-				i++
-				continue
-			}
-		}
-
-		if orderStatus.Status == "FILLED" {
-			b.logger.Printf("订单 %d (%s @ %.4f) 已成交 at %s, 准备挂新单。", grid.OrderID, grid.Side, grid.Price, b.currentTime.Format(time.RFC3339))
-
-			filledPrice, err := strconv.ParseFloat(orderStatus.Price, 64)
-			if err != nil || filledPrice == 0 {
-				filledPrice = grid.Price
-			}
-
-			b.gridLevels = append(b.gridLevels[:i], b.gridLevels[i+1:]...)
-
-			var newSide string
-			var newPrice float64
-			if grid.Side == "BUY" {
-				newSide = "SELL"
-				newPrice = filledPrice * (1 + b.config.GridSpacing)
-				// 这是关键的修正：当买单成交后，如果计算出的新卖单价格超过了回归价，
-				// 我们就简单地不再挂这个卖单，让这个网格分支自然结束。
-				// 这会逐渐减少挂单数量，最终在所有卖单都消失后触发重置。
-				if b.returnPrice > 0 && newPrice > b.returnPrice {
-					b.logger.Printf("[INFO] 网格分支完成: 新卖单价 %.4f 高于回归价 %.4f。不再挂新单。", newPrice, b.returnPrice)
-					continue
-				}
-			} else { // SELL
-				newSide = "BUY"
-				newPrice = filledPrice * (1 - b.config.GridSpacing)
-			}
-
-			quantity := b.calculateQuantity(newPrice)
-
-			order, err := b.exchange.PlaceOrder(b.config.Symbol, newSide, "LIMIT", quantity, newPrice, "LONG")
-			if err != nil {
-				b.logger.Printf("挂新 %s 单失败: %v", newSide, err)
-				continue
-			}
-
-			b.logger.Printf("成功下新 %s 单: ID %d, 价格 %.4f, 数量 %.5f", newSide, order.OrderId, newPrice, quantity)
-
-			newGrid := models.GridLevel{
-				Price:    newPrice,
-				Quantity: quantity,
-				Side:     newSide,
-				OrderID:  order.OrderId,
-				IsActive: true,
-			}
-			b.gridLevels = append(b.gridLevels, newGrid)
-
-		} else if orderStatus.Status == "CANCELED" || orderStatus.Status == "EXPIRED" || orderStatus.Status == "REJECTED" {
-			b.logger.Printf("订单 %d (%s) 已失效 (状态: %s)。将其从活动列表中移除。", grid.OrderID, grid.Side, orderStatus.Status)
-			b.gridLevels = append(b.gridLevels[:i], b.gridLevels[i+1:]...)
-		} else {
-			i++
-		}
-
-	}
-
-	// 修正后的重置逻辑：
-	// 检查是否已无卖单（即空仓），且当前价格超过了回归价
-	hasSellOrders := false
-	for _, grid := range b.gridLevels {
-		if grid.Side == "SELL" {
-			hasSellOrders = true
-			break
+	if len(filledOrders) > 0 {
+		didStateChange = true
+		for info := range filledOrders {
+			b.handleFilledOrder(info.grid, info.status)
 		}
 	}
 
-	if !hasSellOrders && b.returnPrice > 0 {
-		b.logger.Println("-----------------------------------------")
-		b.logger.Printf("[!!!] 网格重置触发！已无卖单，且当前价格 %.4f > 旧回归价 %.4f。", b.currentPrice, b.returnPrice)
-
-		// 释放锁，因为 initializeGrid 会自己加锁
-		b.mutex.Unlock()
-		// 调用初始化函数来重置网格
-		err := b.initializeGrid()
-		// 重新获取锁以保证函数退出时 defer 能正确解锁
-		b.mutex.Lock()
-
-		if err != nil {
-			b.logger.Printf("[ERROR] 重置网格失败: %v", err)
-		} else {
-			b.logger.Printf("[SUCCESS] 网格已在新的价格水平上成功重置。")
+	if len(invalidOrderIDs) > 0 {
+		didStateChange = true
+		for orderID := range invalidOrderIDs {
+			b.removeGridLevel(orderID)
 		}
-		b.logger.Println("-----------------------------------------")
+	}
+
+	// 只有在订单状态真实发生变化后，才重塑网格
+	if didStateChange {
+		b.logger.Println("检测到订单成交或失效，开始重塑网格...")
+		b.maintainGridLevels()
 	}
 }
 
-// reinitializeGridIfNeeded is a safety net to restart the grid if all orders are gone
-func (b *GridTradingBot) reinitializeGridIfNeeded() {
-	b.mutex.Lock()
-	if len(b.gridLevels) == 0 {
-		b.logger.Println("检测到无活动订单，将在一分钟后尝试重新初始化...")
-		b.mutex.Unlock()
-		time.Sleep(1 * time.Minute)
+// handleFilledOrder 处理已成交的订单
+func (b *GridTradingBot) handleFilledOrder(grid models.GridLevel, orderStatus *models.Order) {
+	// 该函数现在期望调用者已经持有锁
 
-		b.mutex.Lock()
-		if len(b.gridLevels) == 0 {
-			b.logger.Println("重新初始化网格...")
-			currentPrice := b.currentPrice
-			initialBuyPrice := currentPrice * (1 - b.config.GridSpacing)
-			initialSellPrice := currentPrice * (1 + b.config.GridSpacing)
-			go b.placeNewOrder("BUY", "LONG", initialBuyPrice)
-			go b.placeNewOrder("SELL", "LONG", initialSellPrice)
-		} else {
-			b.logger.Println("在等待期间已有新订单，取消重新初始化。")
+	b.logger.Printf("订单 %d (%s @ %.4f) 已成交, 准备挂新单。", grid.OrderID, grid.Side, grid.Price)
+
+	// 从活动列表中移除已成交的订单
+	b.removeGridLevel(grid.OrderID)
+
+	filledPrice, err := strconv.ParseFloat(orderStatus.Price, 64)
+	if err != nil || filledPrice == 0 {
+		filledPrice = grid.Price
+	}
+
+	// 移除旧的挂单逻辑。
+	// 新的逻辑是，在移除成交订单后，由 maintainGridLevels 统一负责根据最新价格重塑整个网格，
+	// 而不是在这里简单地挂一个方向相反的订单。
+}
+
+// removeGridLevel 安全地从 gridLevels 中移除一个订单
+func (b *GridTradingBot) removeGridLevel(orderID int64) {
+	newGridLevels := make([]models.GridLevel, 0)
+	for _, g := range b.gridLevels {
+		if g.OrderID != orderID {
+			newGridLevels = append(newGridLevels, g)
 		}
-		b.mutex.Unlock()
-	} else {
-		b.mutex.Unlock()
+	}
+	b.gridLevels = newGridLevels
+}
+
+// maintainGridLevels 检查并维持两侧挂单数量
+func (b *GridTradingBot) maintainGridLevels() {
+	// 该函数期望调用者已经持有锁
+	// 1. 以最新的当前价格为中心，计算出理论上应该存在的3x3网格
+	theoreticalPrices := make(map[float64]string) // price -> side
+	gridSpacing := b.config.GridSpacing
+	currentPrice := b.currentPrice
+
+	var tickSize string
+	for _, f := range b.symbolInfo.Filters {
+		if f.FilterType == "PRICE_FILTER" {
+			tickSize = f.TickSize
+		}
+	}
+
+	for i := 1; i <= ActiveOrdersCount; i++ {
+		// 理论卖单价
+		sellPrice := adjustValueToStep(currentPrice*(1+float64(i)*gridSpacing), tickSize)
+		theoreticalPrices[sellPrice] = "SELL"
+		// 理论买单价
+		buyPrice := adjustValueToStep(currentPrice*(1-float64(i)*gridSpacing), tickSize)
+		theoreticalPrices[buyPrice] = "BUY"
+	}
+
+	// 2. 找出当前实际挂单中，哪些是不在理论网格里的（需要取消）
+	existingPrices := make(map[float64]bool)
+	ordersToCancel := make([]models.GridLevel, 0)
+	for _, grid := range b.gridLevels {
+		if _, exists := theoreticalPrices[grid.Price]; !exists {
+			ordersToCancel = append(ordersToCancel, grid)
+		}
+		existingPrices[grid.Price] = true
+	}
+
+	// 3. 取消多余的订单
+	if len(ordersToCancel) > 0 {
+		b.logger.Println("检测到盘口变化，正在取消不再符合网格布局的旧订单...")
+		for _, grid := range ordersToCancel {
+			b.logger.Printf("正在同步取消订单 ID %d @ %.4f...", grid.OrderID, grid.Price)
+			// 将并发调用改为同步阻塞调用，以避免因时间戳重复导致API错误
+			// 这是解决-1007错误的最终手段
+			if err := b.exchange.CancelOrder(b.config.Symbol, grid.OrderID); err != nil {
+				// 即使取消失败，也打印错误并继续，因为这个订单可能已经不存在了
+				b.logger.Printf("取消订单 ID %d 失败: %v", grid.OrderID, err)
+			}
+			// 从活动列表中移除
+			b.removeGridLevel(grid.OrderID)
+		}
+	}
+
+	// 4. 找出理论网格中，哪些是当前盘口没有的（需要补充）
+	for price, side := range theoreticalPrices {
+		if _, exists := existingPrices[price]; !exists {
+			// 这个价格的订单需要被挂上
+			b.logger.Printf("补充缺失的 %s 订单 @ %.4f", side, price)
+			go b.placeNewOrder(side, price)
+		}
 	}
 }
 
 // connectWebSocket 连接WebSocket获取实时价格
 func (b *GridTradingBot) connectWebSocket() error {
-	wsURL := fmt.Sprintf("%s/ws/%s@ticker", b.config.WSBaseURL, strings.ToLower(b.config.Symbol))
+	wsURL := fmt.Sprintf("%s/ws/%s@aggTrade", b.config.WSBaseURL, strings.ToLower(b.config.Symbol))
 	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
 	if err != nil {
 		return fmt.Errorf("WebSocket连接失败: %v", err)
@@ -301,40 +382,102 @@ func (b *GridTradingBot) connectWebSocket() error {
 	return nil
 }
 
-// handleWebSocketMessages 处理WebSocket消息
-func (b *GridTradingBot) handleWebSocketMessages() {
-	defer b.wsConn.Close()
+// webSocketLoop 是一个守护进程，负责维持WebSocket的连接和重连
+func (b *GridTradingBot) webSocketLoop() {
 	for {
 		select {
 		case <-b.stopChannel:
+			b.logger.Println("WebSocket循环已停止。")
 			return
+		default:
+			if err := b.connectWebSocket(); err != nil {
+				b.logger.Printf("WebSocket连接失败: %v。5秒后重试...", err)
+				time.Sleep(5 * time.Second)
+				continue
+			}
+
+			b.logger.Println("WebSocket连接成功。")
+			// handleWebSocketMessages现在会阻塞直到连接断开
+			if err := b.handleWebSocketMessages(); err != nil {
+				b.logger.Printf("WebSocket处理时发生错误: %v", err)
+			}
+			// 连接断开后，关闭连接，循环会再次尝试重连
+			if b.wsConn != nil {
+				b.wsConn.Close()
+			}
+			b.logger.Println("WebSocket连接已断开，准备重连...")
+			time.Sleep(5 * time.Second) // 等待5秒再重连
+		}
+	}
+}
+
+// handleWebSocketMessages 为一个已建立的连接处理消息，并实现心跳机制
+func (b *GridTradingBot) handleWebSocketMessages() error {
+	const (
+		pongWait   = 60 * time.Second
+		pingPeriod = (pongWait * 9) / 10 // Must be less than pongWait
+	)
+
+	// 设置Pong处理器来延长读取超时
+	b.wsConn.SetReadDeadline(time.Now().Add(pongWait))
+	b.wsConn.SetPongHandler(func(string) error {
+		b.wsConn.SetReadDeadline(time.Now().Add(pongWait))
+		return nil
+	})
+
+	// 启动一个goroutine来定期发送Ping
+	pingTicker := time.NewTicker(pingPeriod)
+	defer pingTicker.Stop()
+
+	// 使用一个单独的channel来停止ping goroutine
+	pingStop := make(chan struct{})
+	defer close(pingStop)
+
+	go func() {
+		for {
+			select {
+			case <-pingTicker.C:
+				if err := b.wsConn.WriteMessage(websocket.PingMessage, nil); err != nil {
+					b.logger.Printf("发送Ping失败: %v", err)
+					return // exit goroutine
+				}
+			case <-pingStop:
+				return
+			case <-b.stopChannel:
+				return
+			}
+		}
+	}()
+
+	// 主循环，用于读取数据消息
+	for {
+		select {
+		case <-b.stopChannel:
+			// 优雅关闭
+			err := b.wsConn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+			if err != nil {
+				return fmt.Errorf("发送WebSocket关闭帧失败: %v", err)
+			}
+			return nil
 		default:
 			_, message, err := b.wsConn.ReadMessage()
 			if err != nil {
-				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-					b.logger.Printf("WebSocket意外关闭: %v", err)
-				}
-				b.logger.Println("WebSocket读取错误，将在10秒后尝试重连...")
-				time.Sleep(10 * time.Second)
-				if err_recon := b.connectWebSocket(); err_recon != nil {
-					b.logger.Printf("WebSocket重连失败: %v", err_recon)
-					return
-				}
-				continue
+				// 任何读取错误都意味着连接已损坏，返回错误让 webSocketLoop 处理重连
+				return fmt.Errorf("读取消息失败: %v", err)
 			}
 
 			var ticker struct {
-				LastPrice json.Number `json:"c"`
+				Price json.Number `json:"p"` // "p"代表价格
 			}
 			if err := json.Unmarshal(message, &ticker); err != nil {
 				b.logger.Printf("解析价格信息失败: %v", err)
-				continue
+				continue // 继续接收下一条消息
 			}
 
-			price, err := ticker.LastPrice.Float64()
+			price, err := ticker.Price.Float64()
 			if err != nil {
 				b.logger.Printf("转换价格失败: %v", err)
-				continue
+				continue // 继续接收下一条消息
 			}
 
 			b.mutex.Lock()
@@ -345,43 +488,86 @@ func (b *GridTradingBot) handleWebSocketMessages() {
 }
 
 // Start 启动机器人进行实时交易
+// Start 启动机器人进行实时交易
 func (b *GridTradingBot) Start() error {
 	b.mutex.Lock()
 	if b.isRunning {
 		b.mutex.Unlock()
 		return fmt.Errorf("机器人已在运行")
 	}
+	b.mutex.Unlock() // 暂时解锁以执行网络操作
+
+	// 1. 检查时间同步
+	serverTime, err := b.exchange.GetServerTime()
+	if err != nil {
+		return fmt.Errorf("获取币安服务器时间失败: %v。请检查网络连接和API配置。", err)
+	}
+	localTime := time.Now().UnixMilli()
+	timeDiff := serverTime - localTime
+	if timeDiff > 1000 || timeDiff < -1000 {
+		b.logger.Fatalf("!!! CRITICAL: 系统时间与币安服务器时间不同步! 偏差: %d ms。请立即同步您的系统时钟(NTP)!", timeDiff)
+	}
+	b.logger.Printf("时间同步检查通过。与服务器时间偏差: %d ms。", timeDiff)
+
+	// 2. 正式开始，锁定状态
+	b.mutex.Lock()
 	b.isRunning = true
 	b.stopChannel = make(chan bool)
 	b.mutex.Unlock()
 
-	if err := b.LoadState("grid_state.json"); err != nil || len(b.gridLevels) == 0 {
-		b.logger.Printf("加载状态失败或状态为空，将进行全新初始化: %v", err)
+	// 3. 从交易所获取真实的挂单情况
+	b.logger.Println("正在从交易所获取当前挂单...")
+	openOrders, err := b.exchange.GetOpenOrders(b.config.Symbol)
+	if err != nil {
+		return fmt.Errorf("从交易所获取挂单列表失败: %v", err)
+	}
+
+	b.mutex.Lock()
+	b.gridLevels = make([]models.GridLevel, 0)
+	for _, order := range openOrders {
+		price, _ := strconv.ParseFloat(order.Price, 64)
+		qty, _ := strconv.ParseFloat(order.OrigQty, 64)
+		b.gridLevels = append(b.gridLevels, models.GridLevel{
+			Price:    price,
+			Quantity: qty,
+			Side:     order.Side,
+			IsActive: true,
+			OrderID:  order.OrderId,
+		})
+	}
+	b.mutex.Unlock()
+
+	// 4. 根据是否存在挂单决定是初始化还是恢复
+	if len(openOrders) == 0 {
+		b.logger.Println("交易所无此交易对的挂单，执行全新初始化...")
 		if err := b.initializeGrid(); err != nil {
 			return fmt.Errorf("初始化网格失败: %v", err)
 		}
 	} else {
-		b.logger.Println("从文件成功恢复状态。")
+		b.logger.Printf("从交易所成功恢复 %d 个挂单。", len(openOrders))
+		// 获取当前价格，然后让 maintainGridLevels 来决定是否需要调整
 		currentPrice, err := b.exchange.GetPrice(b.config.Symbol)
 		if err != nil {
 			return fmt.Errorf("启动时获取当前价格失败: %v", err)
 		}
 		b.mutex.Lock()
 		b.currentPrice = currentPrice
-		b.returnPrice = currentPrice * (1 + b.config.ReturnRate)
 		b.mutex.Unlock()
+
 		if err := b.exchange.SetLeverage(b.config.Symbol, b.config.Leverage); err != nil {
 			b.logger.Printf("设置杠杆失败: %v", err)
 		}
+
+		b.logger.Println("状态恢复完成，开始根据当前价格调整网格...")
+		// 加锁调用 maintainGridLevels
+		b.mutex.Lock()
+		b.maintainGridLevels()
+		b.mutex.Unlock()
 	}
 
-	if err := b.connectWebSocket(); err != nil {
-		return err
-	}
-	go b.handleWebSocketMessages()
-
+	// 5. 启动后台服务
+	go b.webSocketLoop()
 	go b.strategyLoop()
-
 	go b.monitorStatus()
 
 	b.logger.Println("网格交易机器人已启动。")
@@ -403,7 +589,7 @@ func (b *GridTradingBot) strategyLoop() {
 	}
 }
 
-// StartForBacktest 为回测初始化机器人，应用新的建仓策略
+// StartForBacktest 为回测初始化机器人
 func (b *GridTradingBot) StartForBacktest() error {
 	b.mutex.Lock()
 	b.isRunning = true
@@ -411,45 +597,13 @@ func (b *GridTradingBot) StartForBacktest() error {
 		b.mutex.Unlock()
 		return fmt.Errorf("回测开始前必须先设置一个初始价格")
 	}
-	b.returnPrice = b.currentPrice * (1 + b.config.ReturnRate)
 	b.gridLevels = make([]models.GridLevel, 0)
 	b.mutex.Unlock()
 
-	b.logger.Printf("回测模式启动。初始价格: %.4f, 回归价格: %.4f", b.currentPrice, b.returnPrice)
+	b.logger.Printf("回测模式启动。初始价格: %.4f", b.currentPrice)
 
-	// 1. 计算网格数量和总购买量
-	gridSpacing := b.config.GridSpacing
-	numGrids := int(math.Floor(math.Log(b.returnPrice/b.currentPrice) / math.Log(1+gridSpacing)))
-	if numGrids <= 0 {
-		numGrids = 1
-		b.logger.Println("计算出的网格数小于等于0, 将至少创建1个网格。")
-	}
-
-	totalQuantity, estimatedUSDT := b.calculateInitialGrid(b.currentPrice, b.returnPrice, numGrids)
-
-	b.logger.Printf("计算出 %d 个网格，准备市价买入总数量: %.5f (预计花费: %.2f USDT)", numGrids, totalQuantity, estimatedUSDT)
-
-	// 2. 一次性市价买入 (增加风险暴露检查)
-	if !b.isWithinExposureLimit(totalQuantity) {
-		return fmt.Errorf("回测中初始建仓失败：钱包风险暴露将超过限制")
-	}
-	_, err := b.exchange.PlaceOrder(b.config.Symbol, "BUY", "MARKET", totalQuantity, 0, "LONG")
-	if err != nil {
-		return fmt.Errorf("回测中初始市价买入失败: %v", err)
-	}
-
-	// 3. 在对应位置挂空单
-	for i := 0; i < numGrids; i++ {
-		sellPrice := b.currentPrice * math.Pow(1+gridSpacing, float64(i+1))
-		b.placeNewOrder("SELL", "LONG", sellPrice)
-	}
-
-	// 4. 在当前价格下方挂一个多单
-	buyPrice := b.currentPrice * (1 - gridSpacing)
-	b.placeNewOrder("BUY", "LONG", buyPrice)
-
-	b.logger.Println("机器人已为回测初始化。")
-	return nil
+	// 在回测中，直接调用初始化函数来设置初始网格
+	return b.initializeGrid()
 }
 
 // ProcessBacktestTick 在回测期间的每个价格点被调用
@@ -576,7 +730,6 @@ func (b *GridTradingBot) printStatus() {
 	b.logger.Printf("时间: %s", time.Now().Format("2006-01-02 15:04:05"))
 	b.logger.Printf("状态: %s", map[bool]string{true: "运行中", false: "已停止"}[b.isRunning])
 	b.logger.Printf("当前价格: %.8f", b.currentPrice)
-	b.logger.Printf("回归价格: %.8f", b.returnPrice)
 
 	b.logger.Printf("当前挂单数量: %d", len(b.gridLevels))
 	for _, grid := range b.gridLevels {
@@ -605,18 +758,24 @@ func (b *GridTradingBot) printStatus() {
 	b.logger.Println("================================")
 }
 
-// calculateInitialGrid 是一个辅助函数，用于计算初始网格的总购买量和预计花费
-func (b *GridTradingBot) calculateInitialGrid(currentPrice, returnPrice float64, numGrids int) (float64, float64) {
-	gridSpacing := b.config.GridSpacing
-	totalQuantity := 0.0
-	estimatedUSDT := 0.0
-	for i := 0; i < numGrids; i++ {
-		price := currentPrice * math.Pow(1+gridSpacing, float64(i))
-		quantity := b.calculateQuantity(price)
-		totalQuantity += quantity
-		estimatedUSDT += quantity * price // 估算花费的USDT
+// adjustValueToStep 通过字符串操作确保精度，避免浮点数计算误差
+func adjustValueToStep(value float64, step string) float64 {
+	// 找到步长的小数位数
+	if !strings.Contains(step, ".") {
+		// 如果步长是 "1", "10" 等整数，直接取整
+		return math.Floor(value)
 	}
-	return totalQuantity, estimatedUSDT
+	decimalPlaces := len(step) - strings.Index(step, ".") - 1
+
+	// 使用 FormatFloat 将 value 转换为具有正确小数位数的字符串
+	// 'f' 表示常规格式, -1 表示尽可能少的数字, 但这里我们用 decimalPlaces
+	// 乘以一个因子再取整，然后再除以这个因子，是处理浮点数精度的常用方法
+	factor := math.Pow(10, float64(decimalPlaces))
+	adjustedValue := math.Floor(value*factor) / factor
+
+	// 最终再用 strconv 确保转换的正确性
+	finalValue, _ := strconv.ParseFloat(fmt.Sprintf("%.*f", decimalPlaces, adjustedValue), 64)
+	return finalValue
 }
 
 // isWithinExposureLimit 检查增加给定数量的仓位后，钱包风险暴露是否仍在限制内。

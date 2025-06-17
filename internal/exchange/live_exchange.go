@@ -4,15 +4,24 @@ import (
 	"binance-grid-bot-go/internal/models"
 	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
+)
+
+var (
+	logMutex     = &sync.Mutex{}
+	requestNonce int64 // 使用原子操作来确保时间戳的唯一性
 )
 
 // LiveExchange 实现了 Exchange 接口，用于与币安的真实API进行交互。
@@ -25,11 +34,21 @@ type LiveExchange struct {
 
 // NewLiveExchange 创建一个新的 LiveExchange 实例。
 func NewLiveExchange(apiKey, secretKey, baseURL string) *LiveExchange {
+	// 强制使用 HTTP/1.1，禁用 HTTP/2
+	// 这是一个常见的解决棘手的 API 超时问题的方法，可能是因为服务器端的 HTTP/2 实现有问题
+	transport := &http.Transport{
+		ForceAttemptHTTP2: false,
+		TLSNextProto:      make(map[string]func(string, *tls.Conn) http.RoundTripper),
+	}
+
 	return &LiveExchange{
 		apiKey:    apiKey,
 		secretKey: secretKey,
 		baseURL:   baseURL,
-		client:    &http.Client{Timeout: 30 * time.Second},
+		client: &http.Client{
+			Timeout:   30 * time.Second,
+			Transport: transport,
+		},
 	}
 }
 
@@ -48,38 +67,95 @@ func (e *LiveExchange) doRequest(method, endpoint string, params map[string]stri
 		params = make(map[string]string)
 	}
 
+	// 将签名和非签名参数分开处理
+	queryParams := url.Values{}
+	bodyParams := url.Values{}
+
 	if needSign {
-		params["timestamp"] = strconv.FormatInt(time.Now().UnixMilli(), 10)
+		// 通过原子增加一个nonce，确保即使在同一毫秒内发起多个请求，时间戳也是唯一的
+		// 这是解决-1007超时的关键，因为币安服务器可能会拒绝时间戳完全相同的多个请求
+		uniqueTimestamp := time.Now().UnixMilli() + atomic.AddInt64(&requestNonce, 1)
+		params["timestamp"] = strconv.FormatInt(uniqueTimestamp, 10)
 		params["recvWindow"] = "5000"
 	}
 
-	query := url.Values{}
+	// 填充参数
 	for k, v := range params {
-		query.Set(k, v)
+		if method == "POST" || method == "PUT" {
+			bodyParams.Set(k, v)
+		} else { // GET, DELETE
+			queryParams.Set(k, v)
+		}
 	}
-	queryString := query.Encode()
+
+	// --- 核心逻辑修正: 签名应该只针对将要发送的数据 ---
+	var dataToSign string
+	if method == "POST" || method == "PUT" {
+		dataToSign = bodyParams.Encode()
+	} else {
+		dataToSign = queryParams.Encode()
+	}
+
+	var finalQueryString string
+	var finalBody *strings.Reader
 
 	if needSign {
-		signature := e.sign(queryString)
-		queryString += "&signature=" + signature
-	}
-
-	var req *http.Request
-	var err error
-
-	if method == "GET" || method == "DELETE" {
-		u.RawQuery = queryString
-		req, err = http.NewRequest(method, u.String(), nil)
+		signature := e.sign(dataToSign)
+		if method == "POST" || method == "PUT" {
+			// 对于POST/PUT，签名加在body里
+			bodyParams.Set("signature", signature)
+			finalBody = strings.NewReader(bodyParams.Encode())
+			finalQueryString = "" // POST/PUT 的 query string 为空
+		} else {
+			// 对于GET/DELETE，签名加在query string里
+			queryParams.Set("signature", signature)
+			finalBody = nil
+			finalQueryString = queryParams.Encode()
+		}
 	} else {
-		req, err = http.NewRequest(method, u.String(), strings.NewReader(queryString))
+		// 非签名请求
+		finalQueryString = queryParams.Encode()
+		finalBody = strings.NewReader(bodyParams.Encode())
 	}
 
+	if finalQueryString != "" {
+		u.RawQuery = finalQueryString
+	}
+
+	var bodyForRequest io.Reader
+	if finalBody != nil {
+		bodyForRequest = finalBody
+	}
+
+	req, err := http.NewRequest(method, u.String(), bodyForRequest)
 	if err != nil {
 		return nil, err
 	}
 
 	req.Header.Set("X-MBX-APIKEY", e.apiKey)
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if method == "POST" || method == "PUT" {
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	}
+
+	// --- 同步调试日志 ---
+	logMutex.Lock()
+	fmt.Printf("\n--- API Request Details ---\n")
+	fmt.Printf("Time: %s\n", time.Now().Format(time.RFC3339))
+	fmt.Printf("Method: %s\n", method)
+	fmt.Printf("URL: %s\n", u.String())
+	if needSign {
+		fmt.Printf("Data to Sign: %s\n", dataToSign)
+	}
+	if method == "POST" || method == "PUT" {
+		if finalBody != nil {
+			// 为了避免 body 被消耗，我们重新创建一个 reader 来打印
+			bodyBytes, _ := ioutil.ReadAll(strings.NewReader(bodyParams.Encode()))
+			fmt.Printf("Request Body: %s\n", string(bodyBytes))
+		}
+	}
+	fmt.Println("--------------------------")
+	logMutex.Unlock()
+	// --- 调试日志结束 ---
 
 	resp, err := e.client.Do(req)
 	if err != nil {
@@ -143,17 +219,16 @@ func (e *LiveExchange) GetPrice(symbol string) (float64, error) {
 }
 
 // PlaceOrder 下单
-func (e *LiveExchange) PlaceOrder(symbol, side, orderType string, quantity, price float64, positionSide string) (*models.Order, error) {
+func (e *LiveExchange) PlaceOrder(symbol, side, orderType string, quantity, price float64) (*models.Order, error) {
 	params := map[string]string{
-		"symbol":       symbol,
-		"side":         side,
-		"type":         orderType,
-		"quantity":     fmt.Sprintf("%.8f", quantity),
-		"positionSide": positionSide,
+		"symbol":   symbol,
+		"side":     side,
+		"type":     orderType,
+		"quantity": strconv.FormatFloat(quantity, 'f', -1, 64),
 	}
 
 	if orderType == "LIMIT" {
-		params["price"] = fmt.Sprintf("%.8f", price)
+		params["price"] = strconv.FormatFloat(price, 'f', -1, 64)
 		params["timeInForce"] = "GTC"
 	}
 
@@ -250,4 +325,62 @@ func (e *LiveExchange) GetAccountState(symbol string) (positionValue float64, ac
 	accountEquity = totalBalance
 
 	return positionValue, accountEquity, nil
+}
+
+// GetSymbolInfo 获取指定交易对的交易规则
+func (e *LiveExchange) GetSymbolInfo(symbol string) (*models.SymbolInfo, error) {
+	params := map[string]string{}
+	// 如果提供了交易对，就只获取该交易对的信息以提高效率
+	if symbol != "" {
+		params["symbol"] = symbol
+	}
+	data, err := e.doRequest("GET", "/fapi/v1/exchangeInfo", params, false)
+	if err != nil {
+		return nil, err
+	}
+
+	var exchangeInfo models.ExchangeInfo
+	if err := json.Unmarshal(data, &exchangeInfo); err != nil {
+		return nil, fmt.Errorf("无法解析 aexchange info: %v", err)
+	}
+
+	for _, s := range exchangeInfo.Symbols {
+		if s.Symbol == symbol {
+			return &s, nil
+		}
+	}
+
+	return nil, fmt.Errorf("未找到交易对 %s 的信息", symbol)
+}
+
+// GetOpenOrders 获取指定交易对的所有当前挂单
+func (e *LiveExchange) GetOpenOrders(symbol string) ([]models.Order, error) {
+	params := map[string]string{
+		"symbol": symbol,
+	}
+	data, err := e.doRequest("GET", "/fapi/v1/openOrders", params, true)
+	if err != nil {
+		return nil, err
+	}
+
+	var orders []models.Order
+	err = json.Unmarshal(data, &orders)
+	return orders, err
+}
+
+// GetServerTime 获取币安服务器时间
+func (e *LiveExchange) GetServerTime() (int64, error) {
+	data, err := e.doRequest("GET", "/fapi/v1/time", nil, false)
+	if err != nil {
+		return 0, err
+	}
+
+	var serverTime struct {
+		ServerTime int64 `json:"serverTime"`
+	}
+	err = json.Unmarshal(data, &serverTime)
+	if err != nil {
+		return 0, err
+	}
+	return serverTime.ServerTime, nil
 }

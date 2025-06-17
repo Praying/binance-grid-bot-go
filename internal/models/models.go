@@ -10,6 +10,7 @@ type Config struct {
 	Symbol              string  `json:"symbol"`                // 交易对，如 "BTCUSDT"
 	GridSpacing         float64 `json:"grid_spacing"`          // 网格间距比例
 	GridValue           float64 `json:"grid_value"`            // 每个网格的交易价值 (USDT)
+	InitialInvestment   float64 `json:"initial_investment"`    // 初始投资额 (USDT), 用于市价买入
 	Leverage            int     `json:"leverage"`              // 杠杆倍数
 	GridCount           int     `json:"grid_count"`            // 网格数量（对）
 	ReturnRate          float64 `json:"return_rate"`           // 预期回归价格比例
@@ -102,4 +103,25 @@ type CompletedTrade struct {
 	EntryPrice float64
 	ExitPrice  float64 // 新增：记录卖出价格
 	Profit     float64
+}
+
+// ExchangeInfo holds the full exchange information response
+type ExchangeInfo struct {
+	Symbols []SymbolInfo `json:"symbols"`
+}
+
+// SymbolInfo holds trading rules for a single symbol
+type SymbolInfo struct {
+	Symbol  string   `json:"symbol"`
+	Filters []Filter `json:"filters"`
+}
+
+// Filter holds filter data, we are interested in PRICE_FILTER and LOT_SIZE
+type Filter struct {
+	FilterType  string `json:"filterType"`
+	TickSize    string `json:"tickSize,omitempty"`    // For PRICE_FILTER
+	StepSize    string `json:"stepSize,omitempty"`    // For LOT_SIZE
+	MinQty      string `json:"minQty,omitempty"`      // For LOT_SIZE
+	MaxQty      string `json:"maxQty,omitempty"`      // For LOT_SIZE
+	MinNotional string `json:"minNotional,omitempty"` // For MIN_NOTIONAL
 }

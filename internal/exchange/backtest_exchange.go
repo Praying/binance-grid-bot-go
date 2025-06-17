@@ -243,19 +243,18 @@ func (e *BacktestExchange) GetPrice(symbol string) (float64, error) {
 	return e.CurrentPrice, nil
 }
 
-func (e *BacktestExchange) PlaceOrder(symbol, side, orderType string, quantity, price float64, positionSide string) (*models.Order, error) {
+func (e *BacktestExchange) PlaceOrder(symbol, side, orderType string, quantity, price float64) (*models.Order, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	order := &models.Order{
-		OrderId:      e.NextOrderID,
-		Symbol:       e.Symbol, // 强制使用交易所内部的 symbol
-		Side:         side,
-		Type:         orderType,
-		OrigQty:      fmt.Sprintf("%.8f", quantity),
-		Price:        fmt.Sprintf("%.8f", price),
-		PositionSide: positionSide,
-		Status:       "NEW",
+		OrderId: e.NextOrderID,
+		Symbol:  e.Symbol, // 强制使用交易所内部的 symbol
+		Side:    side,
+		Type:    orderType,
+		OrigQty: fmt.Sprintf("%.8f", quantity),
+		Price:   fmt.Sprintf("%.8f", price),
+		Status:  "NEW",
 	}
 	e.orders[order.OrderId] = order
 	e.NextOrderID++
@@ -336,4 +335,50 @@ func (e *BacktestExchange) GetAccountState(symbol string) (positionValue float64
 	}
 
 	return positionValue, accountEquity, nil
+}
+
+// GetSymbolInfo 为回测提供一个模拟的交易规则
+func (e *BacktestExchange) GetSymbolInfo(symbol string) (*models.SymbolInfo, error) {
+	// 对于回测，我们返回一个包含合理默认值的模拟 SymbolInfo
+	// 这避免了在回测模式下进行网络调用
+	return &models.SymbolInfo{
+		Symbol: symbol,
+		Filters: []models.Filter{
+			{
+				FilterType: "PRICE_FILTER",
+				TickSize:   "0.01", // 假设价格精度为2位小数
+			},
+			{
+				FilterType: "LOT_SIZE",
+				StepSize:   "0.001", // 假设数量精度为3位小数
+			},
+			{
+				FilterType:  "MIN_NOTIONAL",
+				MinNotional: "10.0", // 假设最小名义价值为10
+			},
+		},
+	}, nil
+}
+
+// GetOpenOrders 为回测提供一个模拟的实现
+func (e *BacktestExchange) GetOpenOrders(symbol string) ([]models.Order, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	// 在回测中，我们自己管理订单状态，可以直接从业已存在的订单map中筛选
+	openOrders := make([]models.Order, 0)
+	for _, order := range e.orders {
+		if order.Symbol == symbol && order.Status == "NEW" {
+			openOrders = append(openOrders, *order)
+		}
+	}
+	return openOrders, nil
+}
+
+// GetServerTime 为回测提供一个模拟的实现
+func (e *BacktestExchange) GetServerTime() (int64, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	// 在回测中，服务器时间就是当前数据点的时间
+	return e.CurrentTime.UnixMilli(), nil
 }
