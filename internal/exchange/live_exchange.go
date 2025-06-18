@@ -15,33 +15,33 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
 var (
-	logMutex     = &sync.Mutex{}
-	requestNonce int64 // 使用原子操作来确保时间戳的唯一性
+	logMutex = &sync.Mutex{}
 )
 
 // LiveExchange 实现了 Exchange 接口，用于与币安的真实API进行交互。
 type LiveExchange struct {
-	apiKey    string
-	secretKey string
-	baseURL   string
-	client    *http.Client
+	apiKey          string
+	secretKey       string
+	baseURL         string
+	client          *http.Client
+	timeOffset      int64 // 服务器时间与本地时间的毫秒级差值
+	timeOffsetMutex sync.RWMutex
+	stopChan        chan struct{}
 }
 
 // NewLiveExchange 创建一个新的 LiveExchange 实例。
-func NewLiveExchange(apiKey, secretKey, baseURL string) *LiveExchange {
+func NewLiveExchange(apiKey, secretKey, baseURL string) (*LiveExchange, error) {
 	// 强制使用 HTTP/1.1，禁用 HTTP/2
-	// 这是一个常见的解决棘手的 API 超时问题的方法，可能是因为服务器端的 HTTP/2 实现有问题
 	transport := &http.Transport{
 		ForceAttemptHTTP2: false,
 		TLSNextProto:      make(map[string]func(string, *tls.Conn) http.RoundTripper),
 	}
 
-	return &LiveExchange{
+	e := &LiveExchange{
 		apiKey:    apiKey,
 		secretKey: secretKey,
 		baseURL:   baseURL,
@@ -49,7 +49,68 @@ func NewLiveExchange(apiKey, secretKey, baseURL string) *LiveExchange {
 			Timeout:   30 * time.Second,
 			Transport: transport,
 		},
+		stopChan: make(chan struct{}),
 	}
+
+	// 首次同步时间，如果失败则无法启动
+	if err := e.syncTime(); err != nil {
+		return nil, fmt.Errorf("首次时间同步失败: %v", err)
+	}
+
+	// 启动后台 goroutine 定期同步时间
+	go e.runTimeSyncer()
+
+	return e, nil
+}
+
+// Close 优雅地关闭 LiveExchange，停止后台任务。
+func (e *LiveExchange) Close() {
+	close(e.stopChan)
+}
+
+// runTimeSyncer 启动一个 Ticker 来定期调用 syncTime。
+func (e *LiveExchange) runTimeSyncer() {
+	// 每 1 分钟同步一次时间，以更频繁地应对时钟漂移
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			if err := e.syncTime(); err != nil {
+				// 在后台只记录错误，不中断程序
+				fmt.Printf("[TimeSync] 后台时间同步失败: %v\n", err)
+			}
+		case <-e.stopChan:
+			return
+		}
+	}
+}
+
+// syncTime 与服务器同步时间并更新时间偏移量。
+func (e *LiveExchange) syncTime() error {
+	serverTime, err := e.GetServerTime()
+	if err != nil {
+		return err
+	}
+	localTime := time.Now().UnixMilli()
+	offset := serverTime - localTime
+
+	e.timeOffsetMutex.Lock()
+	e.timeOffset = offset
+	e.timeOffsetMutex.Unlock()
+
+	fmt.Printf("[TimeSync] 时间同步完成。本地与服务器时间差: %d ms\n", offset)
+	return nil
+}
+
+// getSynchronizedTimestamp 获取经过校准的时间戳。
+func (e *LiveExchange) getSynchronizedTimestamp() int64 {
+	e.timeOffsetMutex.RLock()
+	offset := e.timeOffset
+	e.timeOffsetMutex.RUnlock()
+	// 只返回校准后的时间，不再添加持续增长的nonce
+	return time.Now().UnixMilli() + offset
 }
 
 // sign 签名函数
@@ -74,8 +135,7 @@ func (e *LiveExchange) doRequest(method, endpoint string, params map[string]stri
 	if needSign {
 		// 通过原子增加一个nonce，确保即使在同一毫秒内发起多个请求，时间戳也是唯一的
 		// 这是解决-1007超时的关键，因为币安服务器可能会拒绝时间戳完全相同的多个请求
-		uniqueTimestamp := time.Now().UnixMilli() + atomic.AddInt64(&requestNonce, 1)
-		params["timestamp"] = strconv.FormatInt(uniqueTimestamp, 10)
+		params["timestamp"] = strconv.FormatInt(e.getSynchronizedTimestamp(), 10)
 		params["recvWindow"] = "5000"
 	}
 

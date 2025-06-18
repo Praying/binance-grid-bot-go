@@ -102,7 +102,11 @@ func runLiveMode(cfg *models.Config) {
 	cfg.WSBaseURL = wsBaseURL
 
 	// 初始化交易所
-	liveExchange := exchange.NewLiveExchange(cfg.APIKey, cfg.SecretKey, cfg.BaseURL)
+	liveExchange, err := exchange.NewLiveExchange(cfg.APIKey, cfg.SecretKey, cfg.BaseURL)
+	if err != nil {
+		log.Fatalf("初始化交易所失败: %v", err)
+	}
+	defer liveExchange.Close() // 确保在函数退出时关闭后台任务
 
 	// 初始化机器人
 	gridBot := bot.NewGridTradingBot(cfg, liveExchange, false)
