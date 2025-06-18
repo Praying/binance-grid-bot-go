@@ -9,5 +9,14 @@
   "leverage": 10,
   "grid_count": 100,
   "return_rate": 0.2,
-  "wallet_exposure_limit": 3.0
+  "wallet_exposure_limit": 3.0,
+  "log": {
+  	"level": "info",
+  	"output": "both",
+  	"file": "logs/grid-bot.log",
+  	"max_size": 10,
+  	"max_backups": 5,
+  	"max_age": 30,
+  	"compress": true
   }
+ }

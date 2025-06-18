@@ -1,6 +1,7 @@
 package exchange
 
 import (
+	"binance-grid-bot-go/internal/logger"
 	"binance-grid-bot-go/internal/models"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -79,7 +80,7 @@ func (e *LiveExchange) runTimeSyncer() {
 		case <-ticker.C:
 			if err := e.syncTime(); err != nil {
 				// 在后台只记录错误，不中断程序
-				fmt.Printf("[TimeSync] 后台时间同步失败: %v\n", err)
+				logger.S().Warnf("[TimeSync] 后台时间同步失败: %v", err)
 			}
 		case <-e.stopChan:
 			return
@@ -100,7 +101,7 @@ func (e *LiveExchange) syncTime() error {
 	e.timeOffset = offset
 	e.timeOffsetMutex.Unlock()
 
-	fmt.Printf("[TimeSync] 时间同步完成。本地与服务器时间差: %d ms\n", offset)
+	logger.S().Infof("[TimeSync] 时间同步完成。本地与服务器时间差: %d ms", offset)
 	return nil
 }
 
@@ -198,24 +199,13 @@ func (e *LiveExchange) doRequest(method, endpoint string, params map[string]stri
 	}
 
 	// --- 同步调试日志 ---
-	logMutex.Lock()
-	fmt.Printf("\n--- API Request Details ---\n")
-	fmt.Printf("Time: %s\n", time.Now().Format(time.RFC3339))
-	fmt.Printf("Method: %s\n", method)
-	fmt.Printf("URL: %s\n", u.String())
-	if needSign {
-		fmt.Printf("Data to Sign: %s\n", dataToSign)
-	}
-	if method == "POST" || method == "PUT" {
-		if finalBody != nil {
-			// 为了避免 body 被消耗，我们重新创建一个 reader 来打印
-			bodyBytes, _ := ioutil.ReadAll(strings.NewReader(bodyParams.Encode()))
-			fmt.Printf("Request Body: %s\n", string(bodyBytes))
-		}
-	}
-	fmt.Println("--------------------------")
-	logMutex.Unlock()
-	// --- 调试日志结束 ---
+	// 使用 Debug 级别的日志记录详细的请求信息，避免在生产环境中刷屏
+	logger.S().Debugw("Sending API Request",
+		"method", method,
+		"url", u.String(),
+		"needs_sign", needSign,
+		"data_to_sign", dataToSign,
+	)
 
 	resp, err := e.client.Do(req)
 	if err != nil {

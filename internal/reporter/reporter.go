@@ -2,8 +2,8 @@ package reporter
 
 import (
 	"binance-grid-bot-go/internal/exchange"
+	"binance-grid-bot-go/internal/logger"
 	"binance-grid-bot-go/internal/models"
-	"log"
 	"math"
 	"sort"
 	"time"
@@ -35,27 +35,27 @@ func GenerateReport(backtestExchange *exchange.BacktestExchange, dataPath string
 	metrics.StartTime = startTime
 	metrics.EndTime = endTime
 
-	log.Println("========== 回测结果报告 ==========")
-	log.Printf("数据文件:         %s", dataPath)
-	log.Printf("交易对:           %s", symbol)
-	log.Printf("回测周期:         %s 到 %s", metrics.StartTime.Format("2006-01-02 15:04"), metrics.EndTime.Format("2006-01-02 15:04"))
-	log.Printf("------------------------------------")
-	log.Printf("初始资金:         %.2f USDT", metrics.InitialBalance)
-	log.Printf("最终资金:         %.2f USDT", metrics.FinalBalance)
-	log.Printf("总利润:           %.2f USDT", metrics.TotalProfit)
-	log.Printf("收益率:           %.2f%%", metrics.ProfitPercentage)
-	log.Printf("------------------------------------")
-	log.Printf("总交易次数:       %d", metrics.TotalTrades)
-	log.Printf("盈利次数:         %d", metrics.WinningTrades)
-	log.Printf("亏损次数:         %d", metrics.LosingTrades)
-	log.Printf("胜率:             %.2f%%", metrics.WinRate)
-	log.Printf("平均盈亏比:       %.2f", metrics.AvgProfitLoss)
-	log.Printf("最大回撤:         %.2f%%", metrics.MaxDrawdown)
-	log.Printf("夏普比率:         %.2f (暂未实现)", metrics.SharpeRatio)
-	log.Printf("--- 期末资产分析 ---")
-	log.Printf("期末现金:         %.2f USDT", metrics.EndingCash)
-	log.Printf("期末持仓市值:     %.2f USDT (共 %.4f %s)", metrics.EndingAssetValue, metrics.TotalAssetQty, symbol)
-	log.Println("===================================")
+	logger.S().Info("========== 回测结果报告 ==========")
+	logger.S().Infof("数据文件:         %s", dataPath)
+	logger.S().Infof("交易对:           %s", symbol)
+	logger.S().Infof("回测周期:         %s 到 %s", metrics.StartTime.Format("2006-01-02 15:04"), metrics.EndTime.Format("2006-01-02 15:04"))
+	logger.S().Info("------------------------------------")
+	logger.S().Infof("初始资金:         %.2f USDT", metrics.InitialBalance)
+	logger.S().Infof("最终资金:         %.2f USDT", metrics.FinalBalance)
+	logger.S().Infof("总利润:           %.2f USDT", metrics.TotalProfit)
+	logger.S().Infof("收益率:           %.2f%%", metrics.ProfitPercentage)
+	logger.S().Info("------------------------------------")
+	logger.S().Infof("总交易次数:       %d", metrics.TotalTrades)
+	logger.S().Infof("盈利次数:         %d", metrics.WinningTrades)
+	logger.S().Infof("亏损次数:         %d", metrics.LosingTrades)
+	logger.S().Infof("胜率:             %.2f%%", metrics.WinRate)
+	logger.S().Infof("平均盈亏比:       %.2f", metrics.AvgProfitLoss)
+	logger.S().Infof("最大回撤:         %.2f%%", metrics.MaxDrawdown)
+	logger.S().Infof("夏普比率:         %.2f (暂未实现)", metrics.SharpeRatio)
+	logger.S().Info("--- 期末资产分析 ---")
+	logger.S().Infof("期末现金:         %.2f USDT", metrics.EndingCash)
+	logger.S().Infof("期末持仓市值:     %.2f USDT (共 %.4f %s)", metrics.EndingAssetValue, metrics.TotalAssetQty, symbol)
+	logger.S().Info("===================================")
 
 	// 新增：打印交易分布分析
 	printTradeDistributionAnalysis(backtestExchange.TradeLog)
@@ -144,10 +144,10 @@ func printTradeDistributionAnalysis(trades []models.CompletedTrade) {
 		return
 	}
 
-	log.Println("--- 交易分布分析 ---")
+	logger.S().Info("--- 交易分布分析 ---")
 	analyzeTradeDistributionByDay(trades)
 	analyzeTradeDistributionByPrice(trades)
-	log.Println("===================================")
+	logger.S().Info("===================================")
 }
 
 // analyzeTradeDistributionByDay 分析每日的交易次数
@@ -165,9 +165,9 @@ func analyzeTradeDistributionByDay(trades []models.CompletedTrade) {
 	}
 	sort.Strings(days)
 
-	log.Println("\n[每日交易次数分布]")
+	logger.S().Info("\n[每日交易次数分布]")
 	for _, day := range days {
-		log.Printf("%s: %d 次", day, tradesByDay[day])
+		logger.S().Infof("%s: %d 次", day, tradesByDay[day])
 	}
 }
 
@@ -187,7 +187,7 @@ func analyzeTradeDistributionByPrice(trades []models.CompletedTrade) {
 	// 动态确定价格步长，目标是分成大约20个区间
 	priceRange := maxPrice - minPrice
 	if priceRange == 0 {
-		log.Println("\n[价格区间交易次数分布]: 所有交易都在同一价格完成。")
+		logger.S().Info("\n[价格区间交易次数分布]: 所有交易都在同一价格完成。")
 		return
 	}
 	step := math.Pow(10, math.Floor(math.Log10(priceRange/20)))
@@ -204,8 +204,8 @@ func analyzeTradeDistributionByPrice(trades []models.CompletedTrade) {
 	}
 	sort.Ints(buckets)
 
-	log.Println("\n[价格区间交易次数分布]")
+	logger.S().Info("\n[价格区间交易次数分布]")
 	for _, bucket := range buckets {
-		log.Printf("~%.4f USDT: %d 次", float64(bucket), tradesByPrice[bucket])
+		logger.S().Infof("~%.4f USDT: %d 次", float64(bucket), tradesByPrice[bucket])
 	}
 }

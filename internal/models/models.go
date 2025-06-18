@@ -4,19 +4,31 @@ import "time"
 
 // Config 结构体定义了机器人的所有配置参数
 type Config struct {
-	APIKey              string  `json:"api_key"`
-	SecretKey           string  `json:"secret_key"`
-	IsTestnet           bool    `json:"is_testnet"`            // 是否使用测试网
-	Symbol              string  `json:"symbol"`                // 交易对，如 "BTCUSDT"
-	GridSpacing         float64 `json:"grid_spacing"`          // 网格间距比例
-	GridValue           float64 `json:"grid_value"`            // 每个网格的交易价值 (USDT)
-	InitialInvestment   float64 `json:"initial_investment"`    // 初始投资额 (USDT), 用于市价买入
-	Leverage            int     `json:"leverage"`              // 杠杆倍数
-	GridCount           int     `json:"grid_count"`            // 网格数量（对）
-	ReturnRate          float64 `json:"return_rate"`           // 预期回归价格比例
-	WalletExposureLimit float64 `json:"wallet_exposure_limit"` // 新增：钱包风险暴露上限
-	BaseURL             string  `json:"base_url"`              // REST API基础地址 (将由程序动态设置)
-	WSBaseURL           string  `json:"ws_base_url"`           // WebSocket基础地址 (将由程序动态设置)
+	APIKey              string    `json:"api_key"`
+	SecretKey           string    `json:"secret_key"`
+	IsTestnet           bool      `json:"is_testnet"`            // 是否使用测试网
+	Symbol              string    `json:"symbol"`                // 交易对，如 "BTCUSDT"
+	GridSpacing         float64   `json:"grid_spacing"`          // 网格间距比例
+	GridValue           float64   `json:"grid_value"`            // 每个网格的交易价值 (USDT)
+	InitialInvestment   float64   `json:"initial_investment"`    // 初始投资额 (USDT), 用于市价买入
+	Leverage            int       `json:"leverage"`              // 杠杆倍数
+	GridCount           int       `json:"grid_count"`            // 网格数量（对）
+	ReturnRate          float64   `json:"return_rate"`           // 预期回归价格比例
+	WalletExposureLimit float64   `json:"wallet_exposure_limit"` // 新增：钱包风险暴露上限
+	LogConfig           LogConfig `json:"log"`                   // 新增：日志配置
+	BaseURL             string    `json:"base_url"`              // REST API基础地址 (将由程序动态设置)
+	WSBaseURL           string    `json:"ws_base_url"`           // WebSocket基础地址 (将由程序动态设置)
+}
+
+// LogConfig 定义了日志相关的配置
+type LogConfig struct {
+	Level      string `json:"level"`       // 日志级别, e.g., "debug", "info", "warn", "error"
+	Output     string `json:"output"`      // 输出模式: "console", "file", "both"
+	File       string `json:"file"`        // 日志文件路径
+	MaxSize    int    `json:"max_size"`    // 单个日志文件的最大大小 (MB)
+	MaxBackups int    `json:"max_backups"` // 保留的旧日志文件最大数量
+	MaxAge     int    `json:"max_age"`     // 旧日志文件的最大保留天数
+	Compress   bool   `json:"compress"`    // 是否压缩旧日志文件
 }
 
 // AccountInfo 定义了币安账户信息
