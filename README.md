@@ -29,7 +29,7 @@ graph TD
     subgraph Live Trading
         C --> C1[Load Config];
         C1 --> C2[Initialize Live Exchange];
-        C2 --> C3[Load State (grid_state.json)];
+        C2 --> C3[Load State ];
         C3 --> C4[Start Bot Logic];
         C4 --> C5[Listen to WebSocket];
         C5 --> C6[Place/Cancel Orders];
@@ -40,7 +40,7 @@ graph TD
         D --> D1[Load Config];
         D1 --> D2{Need to Download Data?};
         D2 -- Yes --> D3[Download Historical Data];
-        D2 -- No --> D4[Load Local Data (*.csv)];
+        D2 -- No --> D4[Load Local Data];
         D3 --> D4;
         D4 --> D5[Initialize Backtest Exchange];
         D5 --> D6[Process Data Tick-by-Tick];
