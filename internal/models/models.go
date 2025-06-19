@@ -16,8 +16,15 @@ type Config struct {
 	ReturnRate          float64   `json:"return_rate"`           // 预期回归价格比例
 	WalletExposureLimit float64   `json:"wallet_exposure_limit"` // 新增：钱包风险暴露上限
 	LogConfig           LogConfig `json:"log"`                   // 新增：日志配置
-	BaseURL             string    `json:"base_url"`              // REST API基础地址 (将由程序动态设置)
-	WSBaseURL           string    `json:"ws_base_url"`           // WebSocket基础地址 (将由程序动态设置)
+
+	// 回测引擎特定配置
+	TakerFeeRate          float64 `json:"taker_fee_rate"`          // 吃单手续费率
+	MakerFeeRate          float64 `json:"maker_fee_rate"`          // 挂单手续费率
+	SlippageRate          float64 `json:"slippage_rate"`           // 滑点率
+	MaintenanceMarginRate float64 `json:"maintenance_margin_rate"` // 维持保证金率
+
+	BaseURL   string `json:"base_url"`    // REST API基础地址 (将由程序动态设置)
+	WSBaseURL string `json:"ws_base_url"` // WebSocket基础地址 (将由程序动态设置)
 }
 
 // LogConfig 定义了日志相关的配置

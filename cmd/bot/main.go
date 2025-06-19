@@ -145,7 +145,6 @@ func runBacktestMode(cfg *models.Config, dataPath string) {
 	logger.S().Info("--- 启动回测模式 ---")
 	cfg.WSBaseURL = "ws://localhost" // 在回测中，我们不需要真实的ws连接
 
-	initialBalance := 10000.0
 	// 从数据路径中提取 symbol，并用它来覆盖 config 中的值
 	backtestSymbol := extractSymbolFromPath(dataPath)
 	if backtestSymbol == "" {
@@ -153,7 +152,8 @@ func runBacktestMode(cfg *models.Config, dataPath string) {
 	}
 	cfg.Symbol = backtestSymbol // 确保机器人逻辑也使用正确的 symbol
 
-	backtestExchange := exchange.NewBacktestExchange(backtestSymbol, initialBalance, cfg.Leverage)
+	// 使用新的构造函数，并传入完整的 config
+	backtestExchange := exchange.NewBacktestExchange(cfg)
 	gridBot := bot.NewGridTradingBot(cfg, backtestExchange, true)
 
 	// 加载并处理历史数据

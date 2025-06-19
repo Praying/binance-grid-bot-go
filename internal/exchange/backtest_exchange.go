@@ -25,6 +25,13 @@ type BacktestExchange struct {
 	Leverage       int
 	mu             sync.Mutex
 
+	// 回测引擎特定配置
+	TakerFeeRate          float64 // 吃单手续费率
+	MakerFeeRate          float64 // 挂单手续费率
+	SlippageRate          float64 // 滑点率
+	MaintenanceMarginRate float64 // 维持保证金率
+	TotalFees             float64 // 累积总手续费
+
 	// 合约交易状态
 	Margin           float64 // 仓位保证金
 	UnrealizedPNL    float64 // 未实现盈亏
@@ -33,22 +40,28 @@ type BacktestExchange struct {
 }
 
 // NewBacktestExchange 创建一个新的 BacktestExchange 实例。
-func NewBacktestExchange(symbol string, initialBalance float64, leverage int) *BacktestExchange {
+func NewBacktestExchange(cfg *models.Config) *BacktestExchange {
+	// 注意：在回测模式下，我们使用 InitialInvestment 作为起始资金
 	return &BacktestExchange{
-		Symbol:           symbol, // 设置交易对
-		InitialBalance:   initialBalance,
-		Cash:             initialBalance,
-		Positions:        make(map[string]float64),
-		AvgEntryPrice:    make(map[string]float64),
-		orders:           make(map[int64]*models.Order),
-		TradeLog:         make([]models.CompletedTrade, 0),
-		EquityCurve:      make([]float64, 0, 10000),
-		NextOrderID:      1,
-		Leverage:         leverage,
-		Margin:           0,
-		UnrealizedPNL:    0,
-		LiquidationPrice: 0,
-		isLiquidated:     false,
+		Symbol:                cfg.Symbol,
+		InitialBalance:        cfg.InitialInvestment,
+		Cash:                  cfg.InitialInvestment,
+		Positions:             make(map[string]float64),
+		AvgEntryPrice:         make(map[string]float64),
+		orders:                make(map[int64]*models.Order),
+		TradeLog:              make([]models.CompletedTrade, 0),
+		EquityCurve:           make([]float64, 0, 10000),
+		NextOrderID:           1,
+		Leverage:              cfg.Leverage,
+		Margin:                0,
+		UnrealizedPNL:         0,
+		LiquidationPrice:      0,
+		isLiquidated:          false,
+		TakerFeeRate:          cfg.TakerFeeRate,
+		MakerFeeRate:          cfg.MakerFeeRate,
+		SlippageRate:          cfg.SlippageRate,
+		MaintenanceMarginRate: cfg.MaintenanceMarginRate,
+		TotalFees:             0,
 	}
 }
 
@@ -118,40 +131,84 @@ func (e *BacktestExchange) checkLimitOrders(high, low float64) {
 func (e *BacktestExchange) handleFilledOrder(order *models.Order) {
 	order.Status = "FILLED"
 
-	price, _ := strconv.ParseFloat(order.Price, 64)
+	limitPrice, _ := strconv.ParseFloat(order.Price, 64)
 	quantity, _ := strconv.ParseFloat(order.OrigQty, 64)
 
+	// --- 1. 计算包含滑点的成交价 ---
+	var executionPrice float64
+	if order.Side == "BUY" {
+		executionPrice = limitPrice * (1 + e.SlippageRate)
+	} else { // SELL
+		executionPrice = limitPrice * (1 - e.SlippageRate)
+	}
+	// 市价单使用当前价作为基础
+	if order.Type == "MARKET" {
+		if order.Side == "BUY" {
+			executionPrice = e.CurrentPrice * (1 + e.SlippageRate)
+		} else {
+			executionPrice = e.CurrentPrice * (1 - e.SlippageRate)
+		}
+	}
+
+	// --- 2. 计算手续费 ---
+	// 假设: LIMIT 单是 Maker, MARKET 单是 Taker
+	feeRate := e.MakerFeeRate
+	if order.Type == "MARKET" {
+		feeRate = e.TakerFeeRate
+	}
+	fee := executionPrice * quantity * feeRate
+	e.TotalFees += fee // 累加手续费
+	e.Cash -= fee      // 无论开仓平仓，手续费总是支出
+
+	// --- 3. 更新仓位和平均开仓价 ---
 	currentPosition := e.Positions[order.Symbol]
 	avgEntry := e.AvgEntryPrice[order.Symbol]
 
-	if order.Side == "BUY" { // 开仓或加仓
+	if order.Side == "BUY" { // 开多仓或加仓
 		newTotalQty := currentPosition + quantity
-		newTotalValue := (avgEntry * currentPosition) + (price * quantity)
+		// 关键：新的开仓价值现在基于滑点后的成交价
+		newTotalValue := (avgEntry * currentPosition) + (executionPrice * quantity)
 		if newTotalQty > 0 {
 			e.AvgEntryPrice[order.Symbol] = newTotalValue / newTotalQty
 		}
 		e.Positions[order.Symbol] = newTotalQty
-	} else { // SELL (平仓)
-		// 修正：在回测中，卖出操作的已实现盈亏是在权益中体现的，而不是直接增加到现金中。
-		// 我们将在这里记录这笔交易的理论利润，但不再错误地修改 e.Cash。
-		realizedPNL := (price - avgEntry) * quantity
-		e.Positions[order.Symbol] -= quantity
+	} else { // SELL (平多仓)
+		// 关键修复: 只有在实际持有多仓时，平仓才有意义并能计算盈亏
+		if currentPosition > 1e-9 { // 使用一个极小值来避免浮点数精度问题
+			// 确保平仓数量不超过当前持仓量
+			sellQuantity := quantity
+			if sellQuantity > currentPosition {
+				// 在当前策略中，这通常意味着一个逻辑错误(例如，尝试平掉比所拥有更多的仓位)
+				// 我们将只平掉所有可用的仓位。
+				// 未来可以考虑在这里添加日志记录。
+				sellQuantity = currentPosition
+			}
 
-		e.TradeLog = append(e.TradeLog, models.CompletedTrade{
-			Symbol:    e.Symbol,
-			Profit:    realizedPNL, // Profit 字段仍然用于报告，但不再影响资金计算
-			ExitTime:  e.CurrentTime,
-			ExitPrice: price,
-		})
+			// 只有在平仓时才计算已实现盈亏
+			realizedPNL := (executionPrice - avgEntry) * sellQuantity
+			e.Cash += realizedPNL // 已实现盈亏直接计入现金
+
+			e.Positions[order.Symbol] -= sellQuantity
+
+			e.TradeLog = append(e.TradeLog, models.CompletedTrade{
+				Symbol:    e.Symbol,
+				Profit:    realizedPNL - fee, // 报告的利润是扣除本次交易费用后的净利润
+				ExitTime:  e.CurrentTime,
+				ExitPrice: executionPrice,
+			})
+		}
+		// 如果 currentPosition <= 0，我们不执行任何操作。
+		// 这是为了防止在没有持仓的情况下（avgEntry 为 0），
+		// 错误地将 `executionPrice * quantity` 记为利润。
 	}
 
-	// 每次成交后，都重新计算保证金、未实现盈亏
+	// --- 4. 更新保证金、PNL和爆仓价 ---
 	e.updateMarginAndPNL()
-	// 关键修复：仅在仍有持仓时才计算爆仓价
-	if e.Positions[order.Symbol] > 0.00000001 { // 使用一个极小值来避免浮点数精度问题
+	if e.Positions[order.Symbol] > 1e-9 { // 使用一个极小值来避免浮点数精度问题
 		e.calculateLiquidationPrice()
 	} else {
-		e.LiquidationPrice = 0 // 确保无持仓时爆仓价为0
+		e.Positions[order.Symbol] = 0 // 仓位归零
+		e.LiquidationPrice = 0        // 确保无持仓时爆仓价为0
 	}
 }
 
@@ -177,14 +234,30 @@ func (e *BacktestExchange) updateMarginAndPNL() {
 // 必须在持有锁的情况下调用。
 func (e *BacktestExchange) calculateLiquidationPrice() {
 	positionSize := e.Positions[e.Symbol]
-	if positionSize > 0.00000001 { // 使用极小值以避免浮点精度问题
-		// **最终修复：引入正确的、考虑现金缓冲的爆仓价模型**
-		// 简化模型：爆仓发生在总浮亏约等于账户可用现金时。
-		// LiquidationPrice = EntryPrice - (Cash / PositionSize)
-		// 这是一个更真实的简化模型，因为它承认了可用现金是抵御亏损的第一道防线。
-		avgEntryPrice := e.AvgEntryPrice[e.Symbol]
-		// 为避免除以零的错误，我们再次确认仓位大小
-		e.LiquidationPrice = avgEntryPrice - (e.Cash / positionSize)
+	avgEntryPrice := e.AvgEntryPrice[e.Symbol]
+	mmr := e.MaintenanceMarginRate
+
+	if positionSize > 1e-9 {
+		// 核心爆仓价公式推导:
+		// 爆仓条件: TotalEquity <= MaintenanceMargin
+		// TotalEquity = Cash + UnrealizedPNL = Cash + (LiquidationPrice - EntryPrice) * PositionSize
+		// MaintenanceMargin = LiquidationPrice * PositionSize * MaintenanceMarginRate
+		// Cash + (LP - EP) * Pos <= LP * Pos * MMR
+		// Cash - EP * Pos <= LP * Pos * MMR - LP * Pos
+		// Cash - EP * Pos <= LP * (Pos * MMR - Pos)
+		// Cash - EP * Pos <= LP * Pos * (MMR - 1)
+		// (Cash - EP * Pos) / (Pos * (MMR - 1)) >= LP
+		// LP <= (EP * Pos - Cash) / (Pos * (1 - MMR))
+		numerator := avgEntryPrice*positionSize - e.Cash
+		denominator := positionSize * (1 - mmr)
+
+		if denominator != 0 {
+			e.LiquidationPrice = numerator / denominator
+		} else {
+			// 分母为零意味着维持保证金率为100%，这在现实中不可能
+			// 但为防止崩溃，设置一个无效值
+			e.LiquidationPrice = -1
+		}
 	} else {
 		e.LiquidationPrice = 0
 	}
@@ -195,36 +268,46 @@ func (e *BacktestExchange) calculateLiquidationPrice() {
 func (e *BacktestExchange) handleLiquidation() {
 	if !e.isLiquidated {
 		e.isLiquidated = true
-		e.Cash -= e.Margin // 扣除保证金
+
+		// 记录爆仓前的状态
+		finalEquity := e.Cash + e.Margin + e.UnrealizedPNL
+		originalPositionSize := e.Positions[e.Symbol]
+		originalAvgEntryPrice := e.AvgEntryPrice[e.Symbol]
+
+		// 爆仓：所有资产清零
+		e.Cash = 0
 		e.Positions[e.Symbol] = 0
 		e.UnrealizedPNL = 0
 		e.Margin = 0
-		// 可以在此处添加日志记录
-		equity := e.Cash + e.Margin + e.UnrealizedPNL
+
 		fmt.Printf(`
 !----- 爆仓事件发生 -----!
 时间: %s
-触发价格: %.4f
+触发价格(成交价): %.4f
 计算出的爆仓价: %.4f
---- 状态快照 ---
+--- 爆仓前状态快照 ---
 可用现金 (Cash): %.4f
 保证金 (Margin): %.4f
 未实现盈亏 (UnrealizedPNL): %.4f
 账户总权益 (Equity): %.4f
 持仓量 (Position Size): %.8f
 平均开仓价 (Avg Entry Price): %.4f
+--- 爆仓后 ---
+账户剩余权益: %.4f
 !--------------------------!
 `,
 			e.CurrentTime.Format(time.RFC3339),
-			e.CurrentPrice,
-			e.LiquidationPrice,
-			e.Cash,
-			e.Margin,
-			e.UnrealizedPNL,
-			equity,
-			e.Positions[e.Symbol],
-			e.AvgEntryPrice[e.Symbol],
+			e.CurrentPrice,     // 实际触发爆仓的价格
+			e.LiquidationPrice, // 爆仓前计算出的理论价格
+			e.Cash,             // 爆仓前现金
+			e.Margin,           // 爆仓前保证金
+			e.UnrealizedPNL,    // 爆仓前未实现盈亏
+			finalEquity,
+			originalPositionSize,
+			originalAvgEntryPrice,
+			e.Cash, // 爆仓后现金 (应为 0)
 		)
+		e.LiquidationPrice = 0 // 爆仓后重置
 	}
 }
 
