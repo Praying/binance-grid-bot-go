@@ -244,10 +244,26 @@ func (b *GridTradingBot) enterMarketAndSetupGrid() error {
 		if err := b.exchange.CancelAllOpenOrders(b.config.Symbol); err != nil {
 			logger.S().Warnf("清理旧订单失败，可能需要手动检查: %v", err)
 		}
-		// 初始挂单逻辑现在也由 resetGridAroundPrice 统一处理
-		// 我们使用当前的入场价作为初始的 "枢轴"
-		b.resetGridAroundPrice(b.entryPrice)
-		logger.S().Info("--- 新周期初始化挂单完成 ---")
+
+		// 找到最接近入场价的网格ID作为初始枢轴
+		initialPivotGridID := -1
+		minDiff := math.MaxFloat64
+		for i, p := range b.conceptualGrid {
+			diff := math.Abs(p - b.entryPrice)
+			if diff < minDiff {
+				minDiff = diff
+				initialPivotGridID = i
+			}
+		}
+
+		if initialPivotGridID != -1 {
+			logger.S().Infof("根据入场价 %.4f, 找到最接近的初始网格ID: %d (价格: %.4f)", b.entryPrice, initialPivotGridID, b.conceptualGrid[initialPivotGridID])
+			// 初始挂单，我们假定这是一个买入事件（因为我们刚建仓），来设置上卖下买的格局
+			b.resetGridAroundPrice(initialPivotGridID, "BUY")
+			logger.S().Info("--- 新周期初始化挂单完成 ---")
+		} else {
+			logger.S().Error("严重错误: 无法在天地网格中为初始入场价找到枢轴点。")
+		}
 	} else {
 		// 这种情况理论上不应发生，因为establishBasePositionAndWait会返回错误
 		logger.S().Error("严重错误：底仓状态未被正确标记，无法进行挂单。")
@@ -365,14 +381,13 @@ func (b *GridTradingBot) calculateQuantity(price float64) (float64, error) {
 }
 
 // resetGridAroundPrice 是新的核心函数，用于在订单成交后重置网格
-func (b *GridTradingBot) resetGridAroundPrice(pivotPrice float64) {
+func (b *GridTradingBot) resetGridAroundPrice(pivotGridID int, pivotSide string) {
 	b.mutex.Lock()
 	defer b.mutex.Unlock()
 
-	logger.S().Infof("--- 基于成交价 %.4f 重置网格 ---", pivotPrice)
+	logger.S().Infof("--- 基于GridID %d (%s) 重置网格 ---", pivotGridID, pivotSide)
 
 	// 1. 取消所有现有订单并清空本地列表
-	// 注意：网络操作在goroutine中执行，以避免阻塞
 	go func() {
 		if err := b.exchange.CancelAllOpenOrders(b.config.Symbol); err != nil {
 			logger.S().Warnf("重置网格时取消所有订单失败: %v", err)
@@ -380,32 +395,23 @@ func (b *GridTradingBot) resetGridAroundPrice(pivotPrice float64) {
 	}()
 	b.gridLevels = make([]models.GridLevel, 0)
 
-	// 2. 在天地网格中找到枢轴价格所属的区间
-	// conceptualGrid 是从高到低排序的
-	sellStartIndex := -1 // 第一个要挂的卖单的索引
-	buyStartIndex := -1  // 第一个要挂的买单的索引
+	// 2. 直接根据 pivotGridID 和 pivotSide 计算新的挂单索引
+	sellStartIndex := -1
+	buyStartIndex := -1
 
-	for i, p := range b.conceptualGrid {
-		if p < pivotPrice {
-			sellStartIndex = i - 1
-			buyStartIndex = i
-			break
-		}
+	if pivotSide == "BUY" {
+		// 如果是买单成交，说明价格下跌触及买单。新的卖单应该挂在成交的这一格，新的买单挂在下一格。
+		sellStartIndex = pivotGridID - 1
+		buyStartIndex = pivotGridID + 1
+	} else { // SELL
+		// 如果是卖单成交，说明价格上涨触及卖单。新的卖单应该挂在上一格，新的买单挂在成交的这一格。
+		sellStartIndex = pivotGridID - 1
+		buyStartIndex = pivotGridID + 1
 	}
-
-	// 处理边界情况：如果价格高于所有网格或低于所有网格
-	if sellStartIndex == -1 && buyStartIndex == -1 {
-		if len(b.conceptualGrid) > 0 && pivotPrice >= b.conceptualGrid[0] {
-			// 价格高于或等于最高网格，只挂买单
-			buyStartIndex = 0
-		} else if len(b.conceptualGrid) > 0 && pivotPrice <= b.conceptualGrid[len(b.conceptualGrid)-1] {
-			// 价格低于或等于最低网格，只挂卖单
-			sellStartIndex = len(b.conceptualGrid) - 1
-		} else {
-			logger.S().Errorf("严重错误：无法为价格 %.4f 定位网格区间。", pivotPrice)
-			return
-		}
-	}
+	logger.S().Debugf(
+		"[DEBUG] 定位枢轴 GridID %d (%s). sellStartIndex: %d, buyStartIndex: %d",
+		pivotGridID, pivotSide, sellStartIndex, buyStartIndex,
+	)
 
 	// 3. 定义需要挂单的列表
 	ordersToPlace := make([]struct {
@@ -415,7 +421,7 @@ func (b *GridTradingBot) resetGridAroundPrice(pivotPrice float64) {
 	}, 0)
 
 	// 4. 准备要挂的卖单
-	if sellStartIndex != -1 {
+	if sellStartIndex >= 0 {
 		for i := 0; i < b.config.ActiveOrdersCount; i++ {
 			index := sellStartIndex - i
 			if index >= 0 {
@@ -431,7 +437,7 @@ func (b *GridTradingBot) resetGridAroundPrice(pivotPrice float64) {
 	}
 
 	// 5. 准备要挂的买单
-	if buyStartIndex != -1 {
+	if buyStartIndex < len(b.conceptualGrid) {
 		for i := 0; i < b.config.ActiveOrdersCount; i++ {
 			index := buyStartIndex + i
 			if index < len(b.conceptualGrid) {
@@ -472,72 +478,65 @@ func (b *GridTradingBot) checkAndHandleFills() {
 		return
 	}
 
-	filledOrders := make([]models.GridLevel, 0)
-	for _, grid := range gridsToCheck {
-		if b.IsBacktest {
-			if (grid.Side == "SELL" && grid.Price <= currentPrice) || (grid.Side == "BUY" && grid.Price >= currentPrice) {
-				filledOrders = append(filledOrders, grid)
+	var filledOrder *models.GridLevel
+
+	// 在回测模式下，我们模拟订单成交
+	if b.IsBacktest {
+		// 为了让行为更可预测，我们排序，确保每次处理的订单是确定的
+		// 买单按价格从高到低（最先可能被触发）
+		// 卖单按价格从低到高（最先可能被触发）
+		sort.Slice(gridsToCheck, func(i, j int) bool {
+			if gridsToCheck[i].Side == "BUY" && gridsToCheck[j].Side == "BUY" {
+				return gridsToCheck[i].Price > gridsToCheck[j].Price
 			}
-		} else {
+			if gridsToCheck[i].Side == "SELL" && gridsToCheck[j].Side == "SELL" {
+				return gridsToCheck[i].Price < gridsToCheck[j].Price
+			}
+			// 如果类型不同，则不改变它们的相对顺序 (虽然在正常操作中不应同时存在)
+			return i < j
+		})
+
+		for i := range gridsToCheck {
+			grid := &gridsToCheck[i]
+			// 在回测中，买单在当前价 <= 挂单价时成交；卖单在当前价 >= 挂单价时成交
+			if (grid.Side == "BUY" && currentPrice <= grid.Price) || (grid.Side == "SELL" && currentPrice >= grid.Price) {
+				filledOrder = grid
+				break // 找到第一个就停止，防止一次处理多个
+			}
+		}
+	} else { // 实盘模式
+		for i := range gridsToCheck {
+			grid := &gridsToCheck[i]
 			status, err := b.exchange.GetOrderStatus(b.config.Symbol, grid.OrderID)
 			if err != nil {
-				// 如果订单未找到，可能已经成交并被处理，可以安全忽略
-				if strings.Contains(err.Error(), "未找到") {
+				if strings.Contains(err.Error(), "未找到") { // 订单已不存在，可能已成交或手动取消
 					continue
 				}
 				logger.S().Warnf("获取订单 %d 状态失败: %v", grid.OrderID, err)
 				continue
 			}
 			if status.Status == "FILLED" {
-				// 获取成交详情以使用实际成交价
-				trade, err := b.exchange.GetLastTrade(b.config.Symbol, grid.OrderID)
-				if err != nil {
-					logger.S().Warnf("获取订单 %d 的成交详情失败，将使用挂单价作为枢轴: %v", grid.OrderID, err)
-					filledOrders = append(filledOrders, grid) // 回退方案
-				} else {
-					price, err := strconv.ParseFloat(trade.Price, 64)
-					if err != nil {
-						logger.S().Warnf("解析真实成交价失败 '%s': %v. 将使用挂单价作为枢轴。", trade.Price, err)
-						// 回退方案
-					} else {
-						grid.Price = price // 使用真实的成交价
-					}
-					filledOrders = append(filledOrders, grid)
-				}
+				filledOrder = grid
+				break // 找到第一个就停止
 			}
 		}
 	}
 
-	if len(filledOrders) == 0 {
-		return
-	}
-
-	// 确定枢轴价格 (pivotPrice)
-	var pivotPrice float64
-	var pivotSide string
-
-	// 对成交订单进行排序以找到正确的枢轴
-	sort.Slice(filledOrders, func(i, j int) bool {
-		if filledOrders[i].Side == "BUY" && filledOrders[j].Side == "BUY" {
-			return filledOrders[i].Price < filledOrders[j].Price // 买单找最低价
+	// 如果有成交的订单，则处理它
+	if filledOrder != nil {
+		logTime := time.Now()
+		if b.IsBacktest {
+			logTime = b.currentTime
 		}
-		if filledOrders[i].Side == "SELL" && filledOrders[j].Side == "SELL" {
-			return filledOrders[i].Price > filledOrders[j].Price // 卖单找最高价
-		}
-		// 如果买卖单混合，优先处理卖单 (这在正常逻辑中不应发生，但作为保障)
-		return filledOrders[i].Side == "SELL"
-	})
+		logger.S().With("time", logTime.Format(time.RFC3339)).Infof(
+			"检测到 %s 订单成交: ID %d, GridID %d, 价格 %.4f",
+			filledOrder.Side, filledOrder.OrderID, filledOrder.GridID, filledOrder.Price,
+		)
 
-	// 第一个订单就是我们的关键订单
-	pivotPrice = filledOrders[0].Price
-	pivotSide = filledOrders[0].Side
-	logger.S().Infof("[STRATEGY] 检测到 %d 个订单成交。关键成交: %s @ %.4f。", len(filledOrders), pivotSide, pivotPrice)
+		// 使用 GridID 和 Side 重置网格
+		b.resetGridAroundPrice(filledOrder.GridID, filledOrder.Side)
 
-	// 使用枢轴价格重置网格
-	b.resetGridAroundPrice(pivotPrice)
-
-	// 检查再入场条件（如果需要）
-	if pivotSide == "SELL" {
+		// 检查是否需要触发再入场
 		b.checkForReentry()
 	}
 }
@@ -561,30 +560,39 @@ func (b *GridTradingBot) checkForReentryLocked() {
 		}
 	}
 
-	// 如果持仓价值小于半个网格，则满足再入场条件
 	currentPrice, _ := b.exchange.GetPrice(b.config.Symbol)
-	// 使用新的逻辑来计算半个网格的价值
+
+	// 主要重启条件：价格达到或超过本周期的回归价格
+	if currentPrice >= b.reversionPrice {
+		if b.isReentering {
+			return
+		}
+		b.isReentering = true
+		select {
+		case b.reentrySignal <- true:
+			logger.S().Infof("!!! 价格 %.4f 已达到回归价 %.4f，触发周期重启 !!!", currentPrice, b.reversionPrice)
+		default:
+		}
+		return // 达到主要目标，直接返回
+	}
+
+	// 备用重启条件：持仓量过低，无法再进行一次卖出
 	singleGridQuantity, err := b.calculateQuantity(currentPrice)
 	if err != nil {
 		logger.S().Errorf("在检查再入场条件时无法计算网格数量: %v", err)
 		return
 	}
-	halfGridValue := (singleGridQuantity * currentPrice) / 2
 
-	if positionAmt*currentPrice < halfGridValue {
-		// 检查状态锁，如果已在再入场流程中，则直接返回
+	// 当持仓量大于0但小于一个网格的量时，说明已经卖到最后了，可以考虑重启
+	if positionAmt > 0 && positionAmt < singleGridQuantity {
 		if b.isReentering {
 			return
 		}
-		// 设置状态锁，防止其他goroutine重复触发
 		b.isReentering = true
-
-		// 发送一个再入场信号，而不是直接启动goroutine
 		select {
 		case b.reentrySignal <- true:
-			logger.S().Info("!!! 满足再入场条件，已发送重启信号 !!!")
+			logger.S().Infof("!!! 持仓量 %.8f 低于单网格量 %.8f，触发备用重启信号 !!!", positionAmt, singleGridQuantity)
 		default:
-			// 如果信号已在队列中，则什么都不做
 		}
 	}
 }
@@ -811,30 +819,39 @@ func (b *GridTradingBot) StartForBacktest() error {
 
 // ProcessBacktestTick 在回测期间的每个价格点被调用
 func (b *GridTradingBot) ProcessBacktestTick() {
-	// 检查再入场信号
-	select {
-	case <-b.reentrySignal:
-		logger.S().Info("--- 回测: 检测到再入场信号，执行重启 ---")
-		b.Stop()
-		// 注意：在回测中，我们不sleep，因为时间是由数据驱动的
-		b.enterMarketAndSetupGrid()
-		// 重启后，这个tick的处理就结束了
-		return
-	default:
-		// 没有信号，继续正常处理
-	}
-
 	b.mutex.Lock()
-	// 在回测中，时间是由回测引擎通过 exchange 模块驱动的
 	b.currentTime = b.exchange.GetCurrentTime()
 	currentPrice, _ := b.exchange.GetPrice(b.config.Symbol)
 	b.currentPrice = currentPrice
 	b.mutex.Unlock()
 
-	// logger.S().Infof("--- 回测 Tick: %s, 价格: %.4f ---", b.currentTime.Format("2006-01-02 15:04:05"), b.currentPrice)
-
-	// 模拟主循环的逻辑: 只检查成交。网格维护由成交事件触发
+	// 1. 检查并处理成交
 	b.checkAndHandleFills()
+
+	// 2. 检查是否需要重新进入
+	b.checkForReentry()
+
+	// 3. 在回测中，我们显式地、非阻塞地检查重启信号
+	select {
+	case <-b.reentrySignal:
+		logger.S().With("time", b.currentTime.Format(time.RFC3339)).Info("--- [回测] 检测到重启信号，执行周期重启 ---")
+		// 在回测中，我们假定所有持仓能以当前市价立即卖出
+		// 注意：这简化了实盘中的滑点等问题
+		positions, err := b.exchange.GetPositions(b.config.Symbol)
+		if err == nil && len(positions) > 0 {
+			positionAmt, _ := strconv.ParseFloat(positions[0].PositionAmt, 64)
+			if positionAmt > 0 {
+				b.exchange.PlaceOrder(b.config.Symbol, "SELL", "MARKET", positionAmt, 0)
+				logger.S().With("time", b.currentTime.Format(time.RFC3339)).Infof("[回测] 模拟市价卖出所有持仓: %.8f", positionAmt)
+			}
+		}
+
+		if err := b.enterMarketAndSetupGrid(); err != nil {
+			logger.S().Fatalf("回测中重启周期失败: %v", err)
+		}
+	default:
+		// 通道中没有信号，什么也不做
+	}
 }
 
 // maintainGridOrders 已被 resetGridAroundPrice 替代，此函数留空或删除
