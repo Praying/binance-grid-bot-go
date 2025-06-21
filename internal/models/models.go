@@ -4,15 +4,18 @@ import "time"
 
 // Config 结构体定义了机器人的所有配置参数
 type Config struct {
-	APIKey              string    `json:"api_key"`
-	SecretKey           string    `json:"secret_key"`
-	IsTestnet           bool      `json:"is_testnet"`            // 是否使用测试网
+	IsTestnet           bool      `json:"is_testnet"` // 是否使用测试网
+	LiveAPIURL          string    `json:"live_api_url"`
+	LiveWSURL           string    `json:"live_ws_url"`
+	TestnetAPIURL       string    `json:"testnet_api_url"`
+	TestnetWSURL        string    `json:"testnet_ws_url"`
 	Symbol              string    `json:"symbol"`                // 交易对，如 "BTCUSDT"
 	GridSpacing         float64   `json:"grid_spacing"`          // 网格间距比例
 	GridValue           float64   `json:"grid_value"`            // 每个网格的交易价值 (USDT)
 	InitialInvestment   float64   `json:"initial_investment"`    // 初始投资额 (USDT), 用于市价买入
 	Leverage            int       `json:"leverage"`              // 杠杆倍数
 	GridCount           int       `json:"grid_count"`            // 网格数量（对）
+	ActiveOrdersCount   int       `json:"active_orders_count"`   // 在价格两侧各挂的订单数量
 	ReturnRate          float64   `json:"return_rate"`           // 预期回归价格比例
 	WalletExposureLimit float64   `json:"wallet_exposure_limit"` // 新增：钱包风险暴露上限
 	LogConfig           LogConfig `json:"log"`                   // 新增：日志配置
@@ -115,13 +118,16 @@ type GridLevel struct {
 
 // CompletedTrade 记录一笔完成的交易（买入和卖出）
 type CompletedTrade struct {
-	Symbol     string
-	Quantity   float64
-	EntryTime  time.Time
-	ExitTime   time.Time
-	EntryPrice float64
-	ExitPrice  float64 // 新增：记录卖出价格
-	Profit     float64
+	Symbol       string
+	Quantity     float64
+	EntryTime    time.Time
+	ExitTime     time.Time
+	HoldDuration time.Duration // 新增：持仓时长
+	EntryPrice   float64
+	ExitPrice    float64 // 新增：记录卖出价格
+	Profit       float64
+	Fee          float64 // 新增：单笔交易手续费
+	Slippage     float64 // 新增：单笔交易滑点成本
 }
 
 // ExchangeInfo holds the full exchange information response

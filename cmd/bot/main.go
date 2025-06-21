@@ -93,22 +93,29 @@ func runLiveMode(cfg *models.Config) {
 	logger.S().Info("--- 启动实时交易模式 ---")
 	stateFilePath := "grid_state.json"
 
+	// 从环境变量加载API密钥
+	apiKey := os.Getenv("BINANCE_API_KEY")
+	secretKey := os.Getenv("BINANCE_SECRET_KEY")
+	if apiKey == "" || secretKey == "" {
+		logger.S().Fatal("错误：BINANCE_API_KEY 和 BINANCE_SECRET_KEY 环境变量必须被设置。")
+	}
+
 	// 根据配置设置API URL
 	var baseURL, wsBaseURL string
 	if cfg.IsTestnet {
-		baseURL = "https://testnet.binancefuture.com"
-		wsBaseURL = "wss://stream.binancefuture.com"
+		baseURL = cfg.TestnetAPIURL
+		wsBaseURL = cfg.TestnetWSURL
 		logger.S().Info("正在使用币安测试网...")
 	} else {
-		baseURL = "https://fapi.binance.com"
-		wsBaseURL = "wss://fstream.binance.com"
+		baseURL = cfg.LiveAPIURL
+		wsBaseURL = cfg.LiveWSURL
 		logger.S().Info("正在使用币安生产网...")
 	}
 	cfg.BaseURL = baseURL
 	cfg.WSBaseURL = wsBaseURL
 
 	// 初始化交易所
-	liveExchange, err := exchange.NewLiveExchange(cfg.APIKey, cfg.SecretKey, cfg.BaseURL)
+	liveExchange, err := exchange.NewLiveExchange(apiKey, secretKey, cfg.BaseURL)
 	if err != nil {
 		logger.S().Fatalf("初始化交易所失败: %v", err)
 	}
@@ -185,18 +192,20 @@ func runBacktestMode(cfg *models.Config, dataPath string) {
 	initialRecord := records[0]
 	initialTimeMs, _ := strconv.ParseInt(initialRecord[0], 10, 64)
 	initialTime := time.UnixMilli(initialTimeMs)
+	initialOpen, errO := strconv.ParseFloat(initialRecord[1], 64)
 	initialHigh, errH := strconv.ParseFloat(initialRecord[2], 64)
 	initialLow, errL := strconv.ParseFloat(initialRecord[3], 64)
 	initialClose, errC := strconv.ParseFloat(initialRecord[4], 64)
-	if errH != nil || errL != nil || errC != nil {
+	if errO != nil || errH != nil || errL != nil || errC != nil {
 		logger.S().With(
+			zap.Error(errO),
 			zap.Error(errH),
 			zap.Error(errL),
 			zap.Error(errC),
 		).Fatal("无法解析初始价格")
 	}
 
-	backtestExchange.SetPrice(initialHigh, initialLow, initialClose, initialTime)
+	backtestExchange.SetPrice(initialOpen, initialHigh, initialLow, initialClose, initialTime)
 	gridBot.SetCurrentPrice(initialClose)
 	if err := gridBot.StartForBacktest(); err != nil {
 		logger.S().Fatalf("回测机器人初始化失败: %v", err)
@@ -206,22 +215,27 @@ func runBacktestMode(cfg *models.Config, dataPath string) {
 	// --- 循环处理所有数据点 ---
 	logger.S().Info("开始回测...")
 	for _, record := range records {
-		// 在每次循环开始时检查是否已爆仓
+		// 检查是否爆仓或进入暂停状态
 		if backtestExchange.IsLiquidated() {
 			logger.S().Warn("检测到爆仓，提前终止回测循环。")
 			break
 		}
+		if gridBot.IsHalted() {
+			logger.S().Info("机器人已暂停，提前终止回测循环。")
+			break
+		}
 
 		timestampMs, errT := strconv.ParseInt(record[0], 10, 64)
+		openPrice, errO := strconv.ParseFloat(record[1], 64)
 		high, errH := strconv.ParseFloat(record[2], 64)
 		low, errL := strconv.ParseFloat(record[3], 64)
 		closePrice, errC := strconv.ParseFloat(record[4], 64)
-		if errT != nil || errH != nil || errL != nil || errC != nil {
+		if errT != nil || errO != nil || errH != nil || errL != nil || errC != nil {
 			logger.S().Warnf("无法解析K线数据，跳过此条记录: %v", record)
 			continue
 		}
 		timestamp := time.UnixMilli(timestampMs)
-		backtestExchange.SetPrice(high, low, closePrice, timestamp)
+		backtestExchange.SetPrice(openPrice, high, low, closePrice, timestamp)
 		gridBot.ProcessBacktestTick()
 	}
 

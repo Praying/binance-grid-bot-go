@@ -11,19 +11,21 @@ import (
 
 // BacktestExchange 实现了 Exchange 接口，用于模拟交易所行为以进行回测。
 type BacktestExchange struct {
-	Symbol         string // 新增：存储当前回测的交易对
-	InitialBalance float64
-	Cash           float64
-	CurrentPrice   float64   // Stores the close price of the current tick
-	CurrentTime    time.Time // Stores the timestamp of the current tick
-	Positions      map[string]float64
-	AvgEntryPrice  map[string]float64
-	orders         map[int64]*models.Order
-	TradeLog       []models.CompletedTrade
-	EquityCurve    []float64
-	NextOrderID    int64
-	Leverage       int
-	mu             sync.Mutex
+	Symbol            string // 新增：存储当前回测的交易对
+	InitialBalance    float64
+	Cash              float64
+	CurrentPrice      float64   // Stores the close price of the current tick
+	CurrentTime       time.Time // Stores the timestamp of the current tick
+	Positions         map[string]float64
+	AvgEntryPrice     map[string]float64
+	positionEntryTime map[string]time.Time // 新增：用于跟踪持仓的开仓时间
+	orders            map[int64]*models.Order
+	TradeLog          []models.CompletedTrade
+	EquityCurve       []float64
+	dailyEquity       map[string]float64 // 新增：用于记录每日权益
+	NextOrderID       int64
+	Leverage          int
+	mu                sync.Mutex
 
 	// 回测引擎特定配置
 	TakerFeeRate          float64 // 吃单手续费率
@@ -48,9 +50,11 @@ func NewBacktestExchange(cfg *models.Config) *BacktestExchange {
 		Cash:                  cfg.InitialInvestment,
 		Positions:             make(map[string]float64),
 		AvgEntryPrice:         make(map[string]float64),
+		positionEntryTime:     make(map[string]time.Time),
 		orders:                make(map[int64]*models.Order),
 		TradeLog:              make([]models.CompletedTrade, 0),
 		EquityCurve:           make([]float64, 0, 10000),
+		dailyEquity:           make(map[string]float64),
 		NextOrderID:           1,
 		Leverage:              cfg.Leverage,
 		Margin:                0,
@@ -66,8 +70,8 @@ func NewBacktestExchange(cfg *models.Config) *BacktestExchange {
 }
 
 // SetPrice 是回测的核心，模拟价格变动并触发订单成交检查。
-// 使用高低价来决定是否成交，收盘价用于记录和更新权益。
-func (e *BacktestExchange) SetPrice(high, low, close float64, timestamp time.Time) {
+// 通过模拟OHLC路径来提高回测精度
+func (e *BacktestExchange) SetPrice(open, high, low, close float64, timestamp time.Time) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -80,8 +84,12 @@ func (e *BacktestExchange) SetPrice(high, low, close float64, timestamp time.Tim
 
 	// --- 核心逻辑顺序重构 ---
 
-	// 步骤 1: 首先，处理所有可能因当前价格(高/低)而成交的订单
-	e.checkLimitOrders(high, low)
+	// 步骤 1: 首先，按O->L->H->C的路径模拟价格变动并处理所有可能成交的订单
+	// 这种方式比仅使用高低点更精确地模拟了K线内部的价格行为
+	e.checkLimitOrdersAtPrice(open)
+	e.checkLimitOrdersAtPrice(low)
+	e.checkLimitOrdersAtPrice(high)
+	e.checkLimitOrdersAtPrice(close)
 
 	// 步骤 2: 然后，基于最新的持仓状态，更新当前价格和所有账户指标
 	e.CurrentPrice = close
@@ -99,8 +107,8 @@ func (e *BacktestExchange) SetPrice(high, low, close float64, timestamp time.Tim
 	e.updateEquity()
 }
 
-// checkLimitOrders 遍历所有订单，检查是否有挂起的限价单可以被当前价格成交。
-func (e *BacktestExchange) checkLimitOrders(high, low float64) {
+// checkLimitOrdersAtPrice 遍历所有订单，检查是否有挂单可以在指定价格点成交。
+func (e *BacktestExchange) checkLimitOrdersAtPrice(price float64) {
 	// 注意：此函数现在应在已持有锁的情况下被调用
 	var orderedIDs []int64
 	for id := range e.orders {
@@ -111,16 +119,17 @@ func (e *BacktestExchange) checkLimitOrders(high, low float64) {
 	for _, orderID := range orderedIDs {
 		order := e.orders[orderID]
 		if order.Status == "NEW" && order.Type == "LIMIT" {
-			price, _ := strconv.ParseFloat(order.Price, 64)
+			limitPrice, _ := strconv.ParseFloat(order.Price, 64)
 			shouldFill := false
-			// 核心逻辑: 使用高低价判断成交
-			if order.Side == "BUY" && low <= price {
+			// 核心逻辑: 使用传入的单一价格点判断成交
+			if order.Side == "BUY" && price <= limitPrice {
 				shouldFill = true
-			} else if order.Side == "SELL" && high >= price {
+			} else if order.Side == "SELL" && price >= limitPrice {
 				shouldFill = true
 			}
 
 			if shouldFill {
+				// 成交价应为挂单价，但为了模拟滑点，handleFilledOrder内部会处理
 				e.handleFilledOrder(order)
 			}
 		}
@@ -165,6 +174,10 @@ func (e *BacktestExchange) handleFilledOrder(order *models.Order) {
 	avgEntry := e.AvgEntryPrice[order.Symbol]
 
 	if order.Side == "BUY" { // 开多仓或加仓
+		// 如果这是第一笔仓位，记录开仓时间
+		if currentPosition <= 1e-9 {
+			e.positionEntryTime[order.Symbol] = e.CurrentTime
+		}
 		newTotalQty := currentPosition + quantity
 		// 关键：新的开仓价值现在基于滑点后的成交价
 		newTotalValue := (avgEntry * currentPosition) + (executionPrice * quantity)
@@ -190,12 +203,27 @@ func (e *BacktestExchange) handleFilledOrder(order *models.Order) {
 
 			e.Positions[order.Symbol] -= sellQuantity
 
+			entryTime := e.positionEntryTime[order.Symbol]
+			holdDuration := e.CurrentTime.Sub(entryTime)
+			slippageCost := (executionPrice - limitPrice) * sellQuantity
+
 			e.TradeLog = append(e.TradeLog, models.CompletedTrade{
-				Symbol:    e.Symbol,
-				Profit:    realizedPNL - fee, // 报告的利润是扣除本次交易费用后的净利润
-				ExitTime:  e.CurrentTime,
-				ExitPrice: executionPrice,
+				Symbol:       e.Symbol,
+				Quantity:     sellQuantity,
+				EntryTime:    entryTime,
+				ExitTime:     e.CurrentTime,
+				HoldDuration: holdDuration,
+				EntryPrice:   avgEntry,
+				ExitPrice:    executionPrice,
+				Profit:       realizedPNL - fee,
+				Fee:          fee,
+				Slippage:     slippageCost,
 			})
+
+			// 如果仓位已完全平掉，重置开仓时间
+			if e.Positions[order.Symbol] <= 1e-9 {
+				delete(e.positionEntryTime, order.Symbol)
+			}
 		}
 		// 如果 currentPosition <= 0，我们不执行任何操作。
 		// 这是为了防止在没有持仓的情况下（avgEntry 为 0），
@@ -236,27 +264,19 @@ func (e *BacktestExchange) calculateLiquidationPrice() {
 	positionSize := e.Positions[e.Symbol]
 	avgEntryPrice := e.AvgEntryPrice[e.Symbol]
 	mmr := e.MaintenanceMarginRate
+	walletBalance := e.Cash + e.Margin // 使用钱包余额，即初始保证金+已实现盈亏
 
 	if positionSize > 1e-9 {
-		// 核心爆仓价公式推导:
-		// 爆仓条件: TotalEquity <= MaintenanceMargin
-		// TotalEquity = Cash + UnrealizedPNL = Cash + (LiquidationPrice - EntryPrice) * PositionSize
-		// MaintenanceMargin = LiquidationPrice * PositionSize * MaintenanceMarginRate
-		// Cash + (LP - EP) * Pos <= LP * Pos * MMR
-		// Cash - EP * Pos <= LP * Pos * MMR - LP * Pos
-		// Cash - EP * Pos <= LP * (Pos * MMR - Pos)
-		// Cash - EP * Pos <= LP * Pos * (MMR - 1)
-		// (Cash - EP * Pos) / (Pos * (MMR - 1)) >= LP
-		// LP <= (EP * Pos - Cash) / (Pos * (1 - MMR))
-		numerator := avgEntryPrice*positionSize - e.Cash
+		// 币安官方爆仓价格公式:
+		// LiqPrice = (EntryPrice * PositionSize - WalletBalance) / (PositionSize * (1 - MaintenanceMarginRate))
+		// 这个公式适用于多头持仓。
+		numerator := avgEntryPrice*positionSize - walletBalance
 		denominator := positionSize * (1 - mmr)
 
 		if denominator != 0 {
 			e.LiquidationPrice = numerator / denominator
 		} else {
-			// 分母为零意味着维持保证金率为100%，这在现实中不可能
-			// 但为防止崩溃，设置一个无效值
-			e.LiquidationPrice = -1
+			e.LiquidationPrice = -1 // 防止除以零
 		}
 	} else {
 		e.LiquidationPrice = 0
@@ -270,7 +290,10 @@ func (e *BacktestExchange) handleLiquidation() {
 		e.isLiquidated = true
 
 		// 记录爆仓前的状态
-		finalEquity := e.Cash + e.Margin + e.UnrealizedPNL
+		originalCash := e.Cash
+		originalMargin := e.Margin
+		originalUnrealizedPNL := e.UnrealizedPNL
+		finalEquity := originalCash + originalMargin + originalUnrealizedPNL
 		originalPositionSize := e.Positions[e.Symbol]
 		originalAvgEntryPrice := e.AvgEntryPrice[e.Symbol]
 
@@ -299,9 +322,9 @@ func (e *BacktestExchange) handleLiquidation() {
 			e.CurrentTime.Format(time.RFC3339),
 			e.CurrentPrice,     // 实际触发爆仓的价格
 			e.LiquidationPrice, // 爆仓前计算出的理论价格
-			e.Cash,             // 爆仓前现金
-			e.Margin,           // 爆仓前保证金
-			e.UnrealizedPNL,    // 爆仓前未实现盈亏
+			originalCash,
+			originalMargin,
+			originalUnrealizedPNL,
 			finalEquity,
 			originalPositionSize,
 			originalAvgEntryPrice,
@@ -316,6 +339,10 @@ func (e *BacktestExchange) updateEquity() {
 	// 合约账户总权益 = 可用现金 + 占用保证金 + 未实现盈亏
 	equity := e.Cash + e.Margin + e.UnrealizedPNL
 	e.EquityCurve = append(e.EquityCurve, equity)
+
+	// 记录每日结束时的权益
+	dayKey := e.CurrentTime.Format("2006-01-02")
+	e.dailyEquity[dayKey] = equity
 }
 
 // --- Exchange 接口实现 ---
@@ -464,4 +491,16 @@ func (e *BacktestExchange) GetServerTime() (int64, error) {
 	defer e.mu.Unlock()
 	// 在回测中，服务器时间就是当前数据点的时间
 	return e.CurrentTime.UnixMilli(), nil
+}
+
+// GetDailyEquity 返回每日权益的只读副本
+func (e *BacktestExchange) GetDailyEquity() map[string]float64 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	// 返回一个副本以防止外部修改
+	cpy := make(map[string]float64)
+	for k, v := range e.dailyEquity {
+		cpy[k] = v
+	}
+	return cpy
 }
