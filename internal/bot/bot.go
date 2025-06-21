@@ -533,11 +533,25 @@ func (b *GridTradingBot) checkAndHandleFills() {
 			filledOrder.Side, filledOrder.OrderID, filledOrder.GridID, filledOrder.Price,
 		)
 
-		// 使用 GridID 和 Side 重置网格
+		// 如果是顶部网格卖单成交，则准备触发重启
+		isTopGridSell := filledOrder.Side == "SELL" && filledOrder.GridID == 0
+
+		// 重置网格
 		b.resetGridAroundPrice(filledOrder.GridID, filledOrder.Side)
 
-		// 检查是否需要触发再入场
-		b.checkForReentry()
+		// 在重置网格后，根据是否为顶部卖单来触发重启
+		if isTopGridSell {
+			b.mutex.Lock()
+			if !b.isReentering {
+				b.isReentering = true
+				select {
+				case b.reentrySignal <- true:
+					logger.S().Infof("!!! 最高网格 (GridID 0) 卖单成交，触发周期重启 !!!")
+				default:
+				}
+			}
+			b.mutex.Unlock()
+		}
 	}
 }
 
@@ -546,55 +560,9 @@ func (b *GridTradingBot) checkAndHandleFills() {
 func (b *GridTradingBot) checkForReentryLocked() {
 	// 注意：此函数期望调用者已经持有锁
 
-	positions, err := b.exchange.GetPositions(b.config.Symbol)
-	if err != nil {
-		logger.S().Errorf("获取持仓以检查再入场条件失败: %v", err)
-		return
-	}
-
-	positionAmt := 0.0
-	if len(positions) > 0 {
-		amt, err := strconv.ParseFloat(positions[0].PositionAmt, 64)
-		if err == nil {
-			positionAmt = amt
-		}
-	}
-
-	currentPrice, _ := b.exchange.GetPrice(b.config.Symbol)
-
-	// 主要重启条件：价格达到或超过本周期的回归价格
-	if currentPrice >= b.reversionPrice {
-		if b.isReentering {
-			return
-		}
-		b.isReentering = true
-		select {
-		case b.reentrySignal <- true:
-			logger.S().Infof("!!! 价格 %.4f 已达到回归价 %.4f，触发周期重启 !!!", currentPrice, b.reversionPrice)
-		default:
-		}
-		return // 达到主要目标，直接返回
-	}
-
-	// 备用重启条件：持仓量过低，无法再进行一次卖出
-	singleGridQuantity, err := b.calculateQuantity(currentPrice)
-	if err != nil {
-		logger.S().Errorf("在检查再入场条件时无法计算网格数量: %v", err)
-		return
-	}
-
-	// 当持仓量大于0但小于一个网格的量时，说明已经卖到最后了，可以考虑重启
-	if positionAmt > 0 && positionAmt < singleGridQuantity {
-		if b.isReentering {
-			return
-		}
-		b.isReentering = true
-		select {
-		case b.reentrySignal <- true:
-			logger.S().Infof("!!! 持仓量 %.8f 低于单网格量 %.8f，触发备用重启信号 !!!", positionAmt, singleGridQuantity)
-		default:
-		}
-	}
+	// --- 新逻辑已移至 checkAndHandleFills ---
+	// 此函数保留为空，以避免破坏回测器中的调用，但不再具有实际的重启逻辑。
+	// 可以在未来的重构中与回测器逻辑一起移除。
 }
 
 // checkForReentry 是一个带锁的公共方法，用于在未持锁的情况下安全地检查再入场条件

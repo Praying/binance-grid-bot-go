@@ -11,21 +11,21 @@ import (
 
 // BacktestExchange 实现了 Exchange 接口，用于模拟交易所行为以进行回测。
 type BacktestExchange struct {
-	Symbol            string // 新增：存储当前回测的交易对
-	InitialBalance    float64
-	Cash              float64
-	CurrentPrice      float64   // Stores the close price of the current tick
-	CurrentTime       time.Time // Stores the timestamp of the current tick
-	Positions         map[string]float64
-	AvgEntryPrice     map[string]float64
-	positionEntryTime map[string]time.Time // 新增：用于跟踪持仓的开仓时间
-	orders            map[int64]*models.Order
-	TradeLog          []models.CompletedTrade
-	EquityCurve       []float64
-	dailyEquity       map[string]float64 // 新增：用于记录每日权益
-	NextOrderID       int64
-	Leverage          int
-	mu                sync.Mutex
+	Symbol         string // 新增：存储当前回测的交易对
+	InitialBalance float64
+	Cash           float64
+	CurrentPrice   float64   // Stores the close price of the current tick
+	CurrentTime    time.Time // Stores the timestamp of the current tick
+	Positions      map[string]float64
+	AvgEntryPrice  map[string]float64
+	buyQueue       map[string][]models.BuyTrade // 新增：FIFO买入队列, 替换 positionEntryTime
+	orders         map[int64]*models.Order
+	TradeLog       []models.CompletedTrade
+	EquityCurve    []float64
+	dailyEquity    map[string]float64 // 新增：用于记录每日权益
+	NextOrderID    int64
+	Leverage       int
+	mu             sync.Mutex
 
 	// 回测引擎特定配置
 	TakerFeeRate          float64 // 吃单手续费率
@@ -52,7 +52,7 @@ func NewBacktestExchange(cfg *models.Config) *BacktestExchange {
 		Cash:                  cfg.InitialInvestment,
 		Positions:             make(map[string]float64),
 		AvgEntryPrice:         make(map[string]float64),
-		positionEntryTime:     make(map[string]time.Time),
+		buyQueue:              make(map[string][]models.BuyTrade),
 		orders:                make(map[int64]*models.Order),
 		TradeLog:              make([]models.CompletedTrade, 0),
 		EquityCurve:           make([]float64, 0, 10000),
@@ -177,61 +177,100 @@ func (e *BacktestExchange) handleFilledOrder(order *models.Order) {
 	currentPosition := e.Positions[order.Symbol]
 	avgEntry := e.AvgEntryPrice[order.Symbol]
 
-	if order.Side == "BUY" { // 开多仓或加仓
-		// 如果这是第一笔仓位，记录开仓时间
-		if currentPosition <= 1e-9 {
-			e.positionEntryTime[order.Symbol] = e.CurrentTime
+	if order.Side == "BUY" {
+		// FIFO Logic: Add buy trade to the queue
+		newBuy := models.BuyTrade{
+			Timestamp: e.CurrentTime,
+			Quantity:  quantity,
+			Price:     executionPrice,
 		}
+		e.buyQueue[order.Symbol] = append(e.buyQueue[order.Symbol], newBuy)
+
+		// Update position and average entry price (existing logic is correct for overall avg price)
 		newTotalQty := currentPosition + quantity
-		// 关键：新的开仓价值现在基于滑点后的成交价
 		newTotalValue := (avgEntry * currentPosition) + (executionPrice * quantity)
 		if newTotalQty > 0 {
 			e.AvgEntryPrice[order.Symbol] = newTotalValue / newTotalQty
 		}
 		e.Positions[order.Symbol] = newTotalQty
-	} else { // SELL (平多仓)
-		// 关键修复: 只有在实际持有多仓时，平仓才有意义并能计算盈亏
-		if currentPosition > 1e-9 { // 使用一个极小值来避免浮点数精度问题
-			// 确保平仓数量不超过当前持仓量
+
+	} else { // SELL (平多仓) with FIFO logic
+		if currentPosition > 1e-9 {
 			sellQuantity := quantity
 			if sellQuantity > currentPosition {
-				// 在当前策略中，这通常意味着一个逻辑错误(例如，尝试平掉比所拥有更多的仓位)
-				// 我们将只平掉所有可用的仓位。
-				// 未来可以考虑在这里添加日志记录。
-				sellQuantity = currentPosition
+				sellQuantity = currentPosition // Do not sell more than we have
 			}
 
-			// 只有在平仓时才计算已实现盈亏
-			realizedPNL := (executionPrice - avgEntry) * sellQuantity
-			e.Cash += realizedPNL // 已实现盈亏直接计入现金
+			var weightedEntryPriceSum float64
+			var weightedHoldDurationSum float64 // in nanoseconds * quantity
+			var quantityToMatch = sellQuantity
+			var consumedCount = 0
 
-			e.Positions[order.Symbol] -= sellQuantity
+			queue := e.buyQueue[order.Symbol]
 
-			entryTime := e.positionEntryTime[order.Symbol]
-			holdDuration := e.CurrentTime.Sub(entryTime)
-			slippageCost := (executionPrice - limitPrice) * sellQuantity
+			for i := range queue {
+				if quantityToMatch < 1e-9 {
+					break
+				}
+				oldestBuy := &queue[i]
 
-			e.TradeLog = append(e.TradeLog, models.CompletedTrade{
-				Symbol:       e.Symbol,
-				Quantity:     sellQuantity,
-				EntryTime:    entryTime,
-				ExitTime:     e.CurrentTime,
-				HoldDuration: holdDuration,
-				EntryPrice:   avgEntry,
-				ExitPrice:    executionPrice,
-				Profit:       realizedPNL - fee,
-				Fee:          fee,
-				Slippage:     slippageCost,
-			})
+				var consumedQty float64
+				if oldestBuy.Quantity <= quantityToMatch {
+					consumedQty = oldestBuy.Quantity
+				} else {
+					consumedQty = quantityToMatch
+				}
 
-			// 如果仓位已完全平掉，重置开仓时间
-			if e.Positions[order.Symbol] <= 1e-9 {
-				delete(e.positionEntryTime, order.Symbol)
+				weightedEntryPriceSum += oldestBuy.Price * consumedQty
+				durationNs := float64(e.CurrentTime.Sub(oldestBuy.Timestamp))
+				weightedHoldDurationSum += durationNs * consumedQty
+
+				oldestBuy.Quantity -= consumedQty
+				quantityToMatch -= consumedQty
+
+				if oldestBuy.Quantity < 1e-9 {
+					consumedCount++
+				}
+			}
+
+			// Clean up fully consumed buy orders from the front of the queue
+			if consumedCount > 0 {
+				e.buyQueue[order.Symbol] = queue[consumedCount:]
+			} else {
+				e.buyQueue[order.Symbol] = queue
+			}
+
+			if sellQuantity > 1e-9 {
+				avgEntryForThisSell := weightedEntryPriceSum / sellQuantity
+				avgHoldDurationNs := weightedHoldDurationSum / sellQuantity
+				avgHoldDuration := time.Duration(avgHoldDurationNs)
+				entryTimeApproximation := e.CurrentTime.Add(-avgHoldDuration)
+
+				realizedPNL := (executionPrice - avgEntryForThisSell) * sellQuantity
+				e.Cash += realizedPNL
+				e.Positions[order.Symbol] -= sellQuantity
+
+				slippageCost := (executionPrice - limitPrice) * sellQuantity
+
+				e.TradeLog = append(e.TradeLog, models.CompletedTrade{
+					Symbol:       e.Symbol,
+					Quantity:     sellQuantity,
+					EntryTime:    entryTimeApproximation,
+					ExitTime:     e.CurrentTime,
+					HoldDuration: avgHoldDuration,
+					EntryPrice:   avgEntryForThisSell,
+					ExitPrice:    executionPrice,
+					Profit:       realizedPNL - fee,
+					Fee:          fee,
+					Slippage:     slippageCost,
+				})
+			}
+
+			// If position is now fully closed, clear the queue to prevent floating point dust
+			if e.Positions[order.Symbol] < 1e-9 {
+				e.buyQueue[order.Symbol] = nil
 			}
 		}
-		// 如果 currentPosition <= 0，我们不执行任何操作。
-		// 这是为了防止在没有持仓的情况下（avgEntry 为 0），
-		// 错误地将 `executionPrice * quantity` 记为利润。
 	}
 
 	// --- 4. 更新保证金、PNL和爆仓价 ---

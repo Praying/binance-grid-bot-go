@@ -133,6 +133,13 @@ type CompletedTrade struct {
 	Slippage     float64 // 新增：单笔交易滑点成本
 }
 
+// BuyTrade records the details of a single buy-in for FIFO accounting.
+type BuyTrade struct {
+	Timestamp time.Time
+	Quantity  float64
+	Price     float64
+}
+
 // ExchangeInfo holds the full exchange information response
 type ExchangeInfo struct {
 	Symbols []SymbolInfo `json:"symbols"`
