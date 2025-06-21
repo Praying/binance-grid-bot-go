@@ -22,4 +22,6 @@ type Exchange interface {
 	GetSymbolInfo(symbol string) (*models.SymbolInfo, error)
 	GetOpenOrders(symbol string) ([]models.Order, error) // 新增：获取所有挂单
 	GetServerTime() (int64, error)                       // 新增：获取服务器时间
+	GetLastTrade(symbol string, orderID int64) (*models.Trade, error)
+	GetMaxWalletExposure() float64
 }

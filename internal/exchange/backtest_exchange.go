@@ -33,12 +33,14 @@ type BacktestExchange struct {
 	SlippageRate          float64 // 滑点率
 	MaintenanceMarginRate float64 // 维持保证金率
 	TotalFees             float64 // 累积总手续费
+	MinNotionalValue      float64 // 新增：最小名义价值
 
 	// 合约交易状态
-	Margin           float64 // 仓位保证金
-	UnrealizedPNL    float64 // 未实现盈亏
-	LiquidationPrice float64 // 预估爆仓价
-	isLiquidated     bool    // 标记是否已爆仓 (私有)
+	Margin            float64 // 仓位保证金
+	UnrealizedPNL     float64 // 未实现盈亏
+	LiquidationPrice  float64 // 预估爆仓价
+	isLiquidated      bool    // 标记是否已爆仓 (私有)
+	MaxWalletExposure float64 // 新增：记录回测期间最大的钱包风险暴露
 }
 
 // NewBacktestExchange 创建一个新的 BacktestExchange 实例。
@@ -66,6 +68,8 @@ func NewBacktestExchange(cfg *models.Config) *BacktestExchange {
 		SlippageRate:          cfg.SlippageRate,
 		MaintenanceMarginRate: cfg.MaintenanceMarginRate,
 		TotalFees:             0,
+		MinNotionalValue:      cfg.MinNotionalValue,
+		MaxWalletExposure:     0.0,
 	}
 }
 
@@ -238,6 +242,45 @@ func (e *BacktestExchange) handleFilledOrder(order *models.Order) {
 		e.Positions[order.Symbol] = 0 // 仓位归零
 		e.LiquidationPrice = 0        // 确保无持仓时爆仓价为0
 	}
+
+	// 打印详细的成交后状态
+	equity := e.Cash + e.Margin + e.UnrealizedPNL
+
+	// 计算 wallet exposure
+	positionValue := e.Positions[order.Symbol] * e.CurrentPrice
+	walletExposure := 0.0
+	if equity > 0 {
+		walletExposure = positionValue / equity
+	}
+	if walletExposure > e.MaxWalletExposure {
+		e.MaxWalletExposure = walletExposure
+	}
+
+	fmt.Printf(`
+--- [回测] 订单成交快照 ---
+时间: %s
+成交订单: %s %s @ %.4f, 数量: %.5f
+--- 持仓状态 ---
+新持仓量: %.5f %s
+平均持仓成本: %.4f
+钱包风险暴露: %.2f%%
+--- 账户状态 ---
+现金余额: %.4f
+保证金: %.4f
+未实现盈亏: %.4f
+账户总权益: %.4f
+--------------------------
+`,
+		e.CurrentTime.Format("2006-01-02 15:04:05"),
+		order.Side, order.Type, executionPrice, quantity,
+		e.Positions[order.Symbol], order.Symbol,
+		e.AvgEntryPrice[order.Symbol],
+		walletExposure*100, // 打印百分比
+		e.Cash,
+		e.Margin,
+		e.UnrealizedPNL,
+		equity,
+	)
 }
 
 // --- 合约交易核心计算方法 --
@@ -464,7 +507,7 @@ func (e *BacktestExchange) GetSymbolInfo(symbol string) (*models.SymbolInfo, err
 			},
 			{
 				FilterType:  "MIN_NOTIONAL",
-				MinNotional: "10.0", // 假设最小名义价值为10
+				MinNotional: fmt.Sprintf("%.2f", e.MinNotionalValue),
 			},
 		},
 	}, nil
@@ -503,4 +546,33 @@ func (e *BacktestExchange) GetDailyEquity() map[string]float64 {
 		cpy[k] = v
 	}
 	return cpy
+}
+
+// GetMaxWalletExposure 返回回测期间记录的最大钱包风险暴露。
+func (e *BacktestExchange) GetMaxWalletExposure() float64 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.MaxWalletExposure
+}
+
+// GetLastTrade 在回测中模拟获取最新成交记录。
+func (e *BacktestExchange) GetLastTrade(symbol string, orderID int64) (*models.Trade, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	order, ok := e.orders[orderID]
+	if !ok {
+		return nil, fmt.Errorf("在回测中未找到订单 ID %d", orderID)
+	}
+
+	// 在回测模式下，我们假设成交价就是订单的挂单价
+	// 我们可以创建一个模拟的 Trade 对象返回
+	return &models.Trade{
+		Symbol:  order.Symbol,
+		OrderID: order.OrderId,
+		Side:    order.Side,
+		Price:   order.Price, // 使用订单价格作为成交价
+		Qty:     order.OrigQty,
+		Time:    e.CurrentTime.UnixMilli(),
+	}, nil
 }

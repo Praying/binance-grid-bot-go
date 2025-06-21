@@ -35,6 +35,7 @@ type Metrics struct {
 	TotalFees           float64       // 新增: 累积总手续费
 	StartTime           time.Time
 	EndTime             time.Time
+	MaxWalletExposure   float64 // 新增：最大钱包风险暴露
 }
 
 // GenerateReport 根据回测交易所的状态计算并打印性能报告
@@ -64,6 +65,7 @@ func GenerateReport(backtestExchange *exchange.BacktestExchange, dataPath string
 	logger.S().Infof("胜率:             %.2f%%", metrics.WinRate)
 	logger.S().Infof("平均盈亏比:       %.2f", metrics.AvgProfitLoss)
 	logger.S().Infof("最大回撤:         %.2f%%", metrics.MaxDrawdown)
+	logger.S().Infof("最大钱包风险暴露: %.2f%%", metrics.MaxWalletExposure*100)
 	logger.S().Info("------------------------------------")
 	logger.S().Infof("平均持仓时长:     %s", metrics.AvgHoldDuration)
 	logger.S().Infof("盈利交易平均时长: %s", metrics.AvgWinHoldDuration)
@@ -169,6 +171,7 @@ func calculateMetrics(be *exchange.BacktestExchange, startTime, endTime time.Tim
 		m.AnnualizedReturn = 0 // 周期太短或利润异常，不计算
 	}
 	m.SharpeRatio = calculateSharpeRatio(be.GetDailyEquity(), 0.0)
+	m.MaxWalletExposure = be.GetMaxWalletExposure()
 
 	return m, be.Symbol
 }

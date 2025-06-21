@@ -9,16 +9,18 @@ type Config struct {
 	LiveWSURL           string    `json:"live_ws_url"`
 	TestnetAPIURL       string    `json:"testnet_api_url"`
 	TestnetWSURL        string    `json:"testnet_ws_url"`
-	Symbol              string    `json:"symbol"`                // 交易对，如 "BTCUSDT"
-	GridSpacing         float64   `json:"grid_spacing"`          // 网格间距比例
-	GridValue           float64   `json:"grid_value"`            // 每个网格的交易价值 (USDT)
-	InitialInvestment   float64   `json:"initial_investment"`    // 初始投资额 (USDT), 用于市价买入
-	Leverage            int       `json:"leverage"`              // 杠杆倍数
-	GridCount           int       `json:"grid_count"`            // 网格数量（对）
-	ActiveOrdersCount   int       `json:"active_orders_count"`   // 在价格两侧各挂的订单数量
-	ReturnRate          float64   `json:"return_rate"`           // 预期回归价格比例
-	WalletExposureLimit float64   `json:"wallet_exposure_limit"` // 新增：钱包风险暴露上限
-	LogConfig           LogConfig `json:"log"`                   // 新增：日志配置
+	Symbol              string    `json:"symbol"`                  // 交易对，如 "BTCUSDT"
+	GridSpacing         float64   `json:"grid_spacing"`            // 网格间距比例
+	GridValue           float64   `json:"grid_value,omitempty"`    // 每个网格的交易价值 (USDT)
+	GridQuantity        float64   `json:"grid_quantity,omitempty"` // 新增：每个网格的交易数量（基础货币）
+	MinNotionalValue    float64   `json:"min_notional_value"`      // 新增: 交易所最小订单名义价值 (例如 5 USDT)
+	InitialInvestment   float64   `json:"initial_investment"`      // 初始投资额 (USDT), 用于市价买入
+	Leverage            int       `json:"leverage"`                // 杠杆倍数
+	GridCount           int       `json:"grid_count"`              // 网格数量（对）
+	ActiveOrdersCount   int       `json:"active_orders_count"`     // 在价格两侧各挂的订单数量
+	ReturnRate          float64   `json:"return_rate"`             // 预期回归价格比例
+	WalletExposureLimit float64   `json:"wallet_exposure_limit"`   // 新增：钱包风险暴露上限
+	LogConfig           LogConfig `json:"log"`                     // 新增：日志配置
 
 	// 回测引擎特定配置
 	TakerFeeRate          float64 `json:"taker_fee_rate"`          // 吃单手续费率
@@ -112,6 +114,7 @@ type GridLevel struct {
 	Side            string  `json:"side"`
 	IsActive        bool    `json:"is_active"`
 	OrderID         int64   `json:"order_id"`
+	GridID          int     `json:"grid_id"`                     // 新增：记录该订单关联的理论网格ID (conceptualGrid的索引)
 	PairID          int     `json:"pair_id"`                     // 用于配对买单和卖单
 	PairedSellPrice float64 `json:"paired_sell_price,omitempty"` // 仅在买单中使用，记录其对应的卖出价
 }
@@ -149,4 +152,23 @@ type Filter struct {
 	MinQty      string `json:"minQty,omitempty"`      // For LOT_SIZE
 	MaxQty      string `json:"maxQty,omitempty"`      // For LOT_SIZE
 	MinNotional string `json:"minNotional,omitempty"` // For MIN_NOTIONAL
+}
+
+// Trade 定义了单次成交的信息
+type Trade struct {
+	Symbol          string `json:"symbol"`
+	ID              int64  `json:"id"`
+	OrderID         int64  `json:"orderId"`
+	Side            string `json:"side"`
+	Price           string `json:"price"`
+	Qty             string `json:"qty"`
+	RealizedPnl     string `json:"realizedPnl"`
+	MarginAsset     string `json:"marginAsset"`
+	QuoteQty        string `json:"quoteQty"`
+	Commission      string `json:"commission"`
+	CommissionAsset string `json:"commissionAsset"`
+	Time            int64  `json:"time"`
+	PositionSide    string `json:"positionSide"`
+	Buyer           bool   `json:"buyer"`
+	Maker           bool   `json:"maker"`
 }

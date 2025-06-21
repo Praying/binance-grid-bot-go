@@ -434,3 +434,35 @@ func (e *LiveExchange) GetServerTime() (int64, error) {
 	}
 	return serverTime.ServerTime, nil
 }
+
+// GetMaxWalletExposure 在实盘模式下不适用，返回 0.0 以满足接口要求。
+func (e *LiveExchange) GetMaxWalletExposure() float64 {
+	return 0.0
+}
+
+// GetLastTrade 获取指定订单的最新成交详情
+func (e *LiveExchange) GetLastTrade(symbol string, orderID int64) (*models.Trade, error) {
+	params := map[string]string{
+		"symbol":  symbol,
+		"orderId": strconv.FormatInt(orderID, 10),
+		"limit":   "1", // 我们只需要最新的成交记录
+	}
+
+	data, err := e.doRequest("GET", "/fapi/v1/userTrades", params, true)
+	if err != nil {
+		return nil, fmt.Errorf("获取成交记录失败: %v", err)
+	}
+
+	var trades []models.Trade
+	if err := json.Unmarshal(data, &trades); err != nil {
+		return nil, fmt.Errorf("解析成交记录失败: %v", err)
+	}
+
+	if len(trades) == 0 {
+		return nil, fmt.Errorf("未找到订单 %d 的成交记录", orderID)
+	}
+
+	// 币安有时会返回与订单无关的成交，我们需要验证一下
+	// 但在这个场景下，既然是按orderId查询，可以信赖返回结果
+	return &trades[0], nil
+}
