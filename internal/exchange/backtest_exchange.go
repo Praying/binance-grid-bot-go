@@ -3,10 +3,14 @@ package exchange
 import (
 	"binance-grid-bot-go/internal/models"
 	"fmt"
+	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/jedib0t/go-pretty/v6/table"
 )
 
 // BacktestExchange 实现了 Exchange 接口，用于模拟交易所行为以进行回测。
@@ -295,31 +299,26 @@ func (e *BacktestExchange) handleFilledOrder(order *models.Order) {
 		e.MaxWalletExposure = walletExposure
 	}
 
-	fmt.Printf(`
---- [回测] 订单成交快照 ---
-时间: %s
-成交订单: %s %s @ %.4f, 数量: %.5f
---- 持仓状态 ---
-新持仓量: %.5f %s
-平均持仓成本: %.4f
-钱包风险暴露: %.2f%%
---- 账户状态 ---
-现金余额: %.4f
-保证金: %.4f
-未实现盈亏: %.4f
-账户总权益: %.4f
---------------------------
-`,
-		e.CurrentTime.Format("2006-01-02 15:04:05"),
-		order.Side, order.Type, executionPrice, quantity,
-		e.Positions[order.Symbol], order.Symbol,
-		e.AvgEntryPrice[order.Symbol],
-		walletExposure*100, // 打印百分比
-		e.Cash,
-		e.Margin,
-		e.UnrealizedPNL,
-		equity,
-	)
+	// 使用 go-pretty 库来确保完美的表格对齐
+	t := table.NewWriter()
+	t.SetOutputMirror(os.Stdout)
+	t.SetTitle(fmt.Sprintf("[回测] 订单成交快照 (%s)", e.CurrentTime.Format("2006-01-02 15:04:05")))
+	t.SetStyle(table.StyleLight) // 使用一个更简洁的样式
+
+	t.AppendRow(table.Row{"成交详情", fmt.Sprintf("%s %s @ %.4f, 数量: %.5f", order.Side, order.Type, executionPrice, quantity)})
+	t.AppendSeparator()
+	t.AppendRow(table.Row{"持仓状态"})
+	t.AppendRow(table.Row{"  新持仓量", fmt.Sprintf("%.5f %s", e.Positions[order.Symbol], strings.Replace(order.Symbol, "USDT", "", -1))})
+	t.AppendRow(table.Row{"  平均持仓成本", fmt.Sprintf("%.4f", e.AvgEntryPrice[order.Symbol])})
+	t.AppendRow(table.Row{"  钱包风险暴露", fmt.Sprintf("%.2f%%", walletExposure*100)})
+	t.AppendSeparator()
+	t.AppendRow(table.Row{"账户状态"})
+	t.AppendRow(table.Row{"  现金余额", fmt.Sprintf("%.4f", e.Cash)})
+	t.AppendRow(table.Row{"  保证金", fmt.Sprintf("%.4f", e.Margin)})
+	t.AppendRow(table.Row{"  未实现盈亏", fmt.Sprintf("%.4f", e.UnrealizedPNL)})
+	t.AppendRow(table.Row{"  账户总权益", fmt.Sprintf("%.4f", equity)})
+
+	t.Render()
 }
 
 // --- 合约交易核心计算方法 --

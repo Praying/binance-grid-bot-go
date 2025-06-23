@@ -186,12 +186,12 @@ func (b *GridTradingBot) enterMarketAndSetupGrid() error {
 	logger.S().Infof("成功生成“天地网格”，共 %d 个理论价位。", len(b.conceptualGrid))
 	// 打印详细的网格价位以供调试
 	if len(b.conceptualGrid) > 0 {
-		logger.S().Info("--- 理论天地网格详细价位 ---")
+		logger.S().Debug("--- 理论天地网格详细价位 ---")
 		// 为了避免刷屏，可以考虑只打印部分，但为了调试清晰，暂时全部打印
 		for i, p := range b.conceptualGrid {
-			logger.S().Infof("  - 网格 %d: %.4f", i+1, p)
+			logger.S().Debugf("  - 网格 %d: %.4f", i+1, p)
 		}
-		logger.S().Info("-----------------------------")
+		logger.S().Debug("-----------------------------")
 	}
 
 	// 步骤 3: 计算并建立底仓 (部分持仓模式)
@@ -349,7 +349,7 @@ func (b *GridTradingBot) calculateQuantity(price float64) (float64, error) {
 
 	// 3. 验证并调整数量以满足最小名义价值
 	if price*quantity < minNotionalValue {
-		logger.S().Warnf(
+		logger.S().Debugf(
 			"按当前配置计算的数量 %.8f (价值 %.4f) 低于交易所最小名义价值 %.4f。将自动调整数量以满足最小价值。",
 			quantity, price*quantity, minNotionalValue,
 		)
@@ -358,7 +358,7 @@ func (b *GridTradingBot) calculateQuantity(price float64) (float64, error) {
 
 	// 4. 验证并调整数量以满足最小订单量
 	if quantity < minQtyValue {
-		logger.S().Warnf(
+		logger.S().Debugf(
 			"计算出的数量 %.8f 低于最小订单量 %.8f。将自动调整到最小订单量。",
 			quantity, minQtyValue,
 		)
@@ -455,7 +455,40 @@ func (b *GridTradingBot) resetGridAroundPrice(pivotGridID int, pivotSide string)
 	// 6. 异步下单
 	if len(ordersToPlace) > 0 {
 		logger.S().Infof("准备挂 %d 个新订单...", len(ordersToPlace))
+
+		// 新增：排序和打印挂单详情
+		// 按价格从高到低排序
+		sort.Slice(ordersToPlace, func(i, j int) bool {
+			return ordersToPlace[i].Price > ordersToPlace[j].Price
+		})
+
+		logger.S().Debug("--- 详细挂单列表 (按价格升序) ---")
+		for _, order := range ordersToPlace {
+			// 为了打印数量，需要提前计算
+			quantity, err := b.calculateQuantity(order.Price)
+			if err != nil {
+				logger.S().Warnf("无法为价格 %.4f 计算挂单数量: %v", order.Price, err)
+				// 如果计算失败，则无法打印数量，但仍可继续尝试下单
+				logger.S().Debugf("  - 方向: %s, 价格: %.4f, 数量: [计算失败], 对应概念网格ID: %d",
+					order.Side,
+					order.Price,
+					order.GridID,
+				)
+				continue
+			}
+			logger.S().Debugf("  - 方向: %s, 价格: %.4f, 数量: %.8f, 对应概念网格ID: %d",
+				order.Side,
+				order.Price,
+				quantity,
+				order.GridID,
+			)
+		}
+		logger.S().Debug("---------------------------------")
+
 		go func() {
+			// 注意：这里的 placeNewOrder 内部会再次计算数量，但这是必要的，
+			// 因为我们要确保下单时的计算是最新的，且能处理上面计算失败的情况。
+			// 此处的日志打印主要是为了调试和增加透明度。
 			for _, order := range ordersToPlace {
 				b.placeNewOrder(order.Side, order.Price, order.GridID)
 			}
@@ -528,10 +561,32 @@ func (b *GridTradingBot) checkAndHandleFills() {
 		if b.IsBacktest {
 			logTime = b.currentTime
 		}
-		logger.S().With("time", logTime.Format(time.RFC3339)).Infof(
-			"检测到 %s 订单成交: ID %d, GridID %d, 价格 %.4f",
-			filledOrder.Side, filledOrder.OrderID, filledOrder.GridID, filledOrder.Price,
-		)
+		if filledOrder.Side == "SELL" {
+			// 计算并记录利润
+			profit := 0.0
+			// 对应的买单应该在当前卖单的下一格（ID更大）
+			buyGridID := filledOrder.GridID + 1
+			if buyGridID < len(b.conceptualGrid) {
+				buyPrice := b.conceptualGrid[buyGridID]
+				// 注意：这里的 filledOrder.Quantity 是指这一个网格的交易量
+				profit = (filledOrder.Price - buyPrice) * filledOrder.Quantity
+				logger.S().With("time", logTime.Format(time.RFC3339)).Infof(
+					"✅ 网格交易盈利: %.4f USDT | 成交卖单: ID %d, GridID %d, 价格 %.4f | 对应理论买单: GridID %d, 价格 %.4f",
+					profit, filledOrder.OrderID, filledOrder.GridID, filledOrder.Price, buyGridID, buyPrice,
+				)
+			} else {
+				// 这是一个网格最底部的卖单, 理论上在我们的策略中不应该出现, 但作为防御性编程处理.
+				logger.S().With("time", logTime.Format(time.RFC3339)).Warnf(
+					"检测到 SELL 订单成交，但无法找到配对的理论买单: ID %d, GridID %d, 价格 %.4f",
+					filledOrder.OrderID, filledOrder.GridID, filledOrder.Price,
+				)
+			}
+		} else { // BUY
+			logger.S().With("time", logTime.Format(time.RFC3339)).Infof(
+				"⤵️  检测到 BUY 订单成交: ID %d, GridID %d, 价格 %.4f",
+				filledOrder.OrderID, filledOrder.GridID, filledOrder.Price,
+			)
+		}
 
 		// 如果是顶部网格卖单成交，则准备触发重启
 		isTopGridSell := filledOrder.Side == "SELL" && filledOrder.GridID == 0
@@ -939,14 +994,14 @@ func (b *GridTradingBot) printStatus() {
 	b.mutex.RLock()
 	defer b.mutex.RUnlock()
 
-	logger.S().Info("========== 机器人状态 ==========")
-	logger.S().Infof("时间: %s", time.Now().Format("2006-01-02 15:04:05"))
-	logger.S().Infof("状态: %s", map[bool]string{true: "运行中", false: "已停止"}[b.isRunning])
-	logger.S().Infof("当前价格: %.8f", b.currentPrice)
+	logger.S().Debug("========== 机器人状态 ==========")
+	logger.S().Debugf("时间: %s", time.Now().Format("2006-01-02 15:04:05"))
+	logger.S().Debugf("状态: %s", map[bool]string{true: "运行中", false: "已停止"}[b.isRunning])
+	logger.S().Debugf("当前价格: %.8f", b.currentPrice)
 
-	logger.S().Infof("当前挂单数量: %d", len(b.gridLevels))
+	logger.S().Debugf("当前挂单数量: %d", len(b.gridLevels))
 	for _, grid := range b.gridLevels {
-		logger.S().Infof("  - [ID: %d] %s %.5f @ %.4f", grid.OrderID, grid.Side, grid.Quantity, grid.Price)
+		logger.S().Debugf("  - [ID: %d] %s %.5f @ %.4f", grid.OrderID, grid.Side, grid.Quantity, grid.Price)
 	}
 
 	positions, err := b.exchange.GetPositions(b.config.Symbol)
@@ -959,16 +1014,16 @@ func (b *GridTradingBot) printStatus() {
 			if math.Abs(posAmt) > 0 {
 				entryPrice, _ := strconv.ParseFloat(pos.EntryPrice, 64)
 				unrealizedProfit, _ := strconv.ParseFloat(pos.UnRealizedProfit, 64)
-				logger.S().Infof("持仓: %.5f %s, 开仓均价: %.8f, 未实现盈亏: %.8f",
+				logger.S().Debugf("持仓: %.5f %s, 开仓均价: %.8f, 未实现盈亏: %.8f",
 					posAmt, b.config.Symbol, entryPrice, unrealizedProfit)
 				hasPosition = true
 			}
 		}
 		if !hasPosition {
-			logger.S().Info("当前无持仓。")
+			logger.S().Debug("当前无持仓。")
 		}
 	}
-	logger.S().Info("================================")
+	logger.S().Debug("================================")
 }
 
 // adjustValueToStep 通过字符串操作确保精度，避免浮点数计算误差

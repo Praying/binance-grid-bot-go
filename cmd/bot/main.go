@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/joho/godotenv"
 	"go.uber.org/zap"
 )
 
@@ -47,45 +48,79 @@ func main() {
 	endDate := flag.String("end", "", "end date for backtesting (YYYY-MM-DD)")
 	flag.Parse()
 
-	// --- 加载配置 ---
+	// --- 初始化日志 (提前) ---
+	// 为了在加载.env或配置时就能记录日志，我们需要先于其他逻辑初始化一个临时的或默认的logger
+	// 这里我们假设InitLogger可以被安全地提前调用
+	logger.InitLogger(models.LogConfig{Level: "info", Output: "console"}) // 使用一个默认配置
+
+	// --- 加载 .env 文件 ---
+	err := godotenv.Load()
+	if err != nil {
+		logger.S().Info("未找到 .env 文件，将从系统环境变量中读取。")
+	} else {
+		logger.S().Info("成功从 .env 文件加载配置。")
+	}
+
+	// --- 加载 JSON 配置 ---
 	cfg, err := config.LoadConfig(*configPath)
 	if err != nil {
 		logger.S().Fatalf("无法加载配置文件: %v", err)
 	}
 
-	// --- 初始化日志 ---
+	// --- 使用文件中的配置重新初始化日志 ---
 	logger.InitLogger(cfg.LogConfig)
 	defer logger.S().Sync() // 确保在main函数退出时刷新所有缓冲的日志
 
 	// --- 根据模式执行 ---
-	if *mode == "live" {
+	switch *mode {
+	case "live":
 		runLiveMode(cfg)
-	} else if *mode == "backtest" {
-		// 自动下载数据逻辑
-		if *symbol != "" && *startDate != "" && *endDate != "" {
-			startTime, err1 := time.Parse("2006-01-02", *startDate)
-			endTime, err2 := time.Parse("2006-01-02", *endDate)
-			if err1 != nil || err2 != nil {
-				logger.S().Fatal("日期格式错误，请使用 YYYY-MM-DD 格式。")
-			}
-
-			downloader := downloader.NewKlineDownloader()
-			fileName := fmt.Sprintf("data/%s-%s-%s.csv", *symbol, *startDate, *endDate)
-			logger.S().Infof("开始下载 %s 从 %s 到 %s 的K线数据...", *symbol, *startDate, *endDate)
-
-			if err := downloader.DownloadKlines(*symbol, fileName, startTime, endTime); err != nil {
-				logger.S().Fatalf("下载数据失败: %v", err)
-			}
-			*dataPath = fileName // 将下载的文件路径设置为回测数据路径
+	case "backtest":
+		finalDataPath, err := handleBacktestMode(*symbol, *startDate, *endDate, *dataPath)
+		if err != nil {
+			logger.S().Fatal(err)
 		}
-
-		if *dataPath == "" {
-			logger.S().Fatal("回测模式需要通过 --data 或 --symbol/start/end 参数指定数据源。")
-		}
-		runBacktestMode(cfg, *dataPath)
-	} else {
+		runBacktestMode(cfg, finalDataPath)
+	default:
 		logger.S().Fatalf("未知的运行模式: %s。请选择 'live' 或 'backtest'。", *mode)
 	}
+}
+
+// handleBacktestMode 处理回测模式的启动逻辑，包括数据下载。
+// 成功后返回数据文件路径，失败则返回错误。
+func handleBacktestMode(symbol, startDate, endDate, dataPath string) (string, error) {
+	// 检查是否需要下载数据
+	shouldDownload := symbol != "" && startDate != "" && endDate != ""
+
+	if shouldDownload {
+		startTime, err1 := time.Parse("2006-01-02", startDate)
+		endTime, err2 := time.Parse("2006-01-02", endDate)
+		if err1 != nil || err2 != nil {
+			return "", fmt.Errorf("日期格式错误，请使用 YYYY-MM-DD 格式。start: %v, end: %v", err1, err2)
+		}
+
+		// 确保数据目录存在
+		if _, err := os.Stat("data"); os.IsNotExist(err) {
+			if err := os.Mkdir("data", 0755); err != nil {
+				return "", fmt.Errorf("创建 data 目录失败: %v", err)
+			}
+		}
+
+		downloader := downloader.NewKlineDownloader()
+		fileName := fmt.Sprintf("data/%s-%s-%s.csv", symbol, startDate, endDate)
+		logger.S().Infof("开始下载 %s 从 %s 到 %s 的K线数据...", symbol, startDate, endDate)
+
+		if err := downloader.DownloadKlines(symbol, fileName, startTime, endTime); err != nil {
+			return "", fmt.Errorf("下载数据失败: %v", err)
+		}
+		return fileName, nil // 返回下载好的文件路径
+	}
+
+	// 如果不下载，则必须提供数据路径
+	if dataPath == "" {
+		return "", fmt.Errorf("回测模式需要通过 --data 或 --symbol/start/end 参数指定数据源")
+	}
+	return dataPath, nil
 }
 
 // runLiveMode 运行实时交易机器人

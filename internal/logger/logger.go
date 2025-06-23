@@ -23,7 +23,8 @@ func InitLogger(cfg models.LogConfig) {
 	// 配置encoder
 	encoderConfig := zap.NewProductionEncoderConfig()
 	encoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
-	jsonEncoder := zapcore.NewJSONEncoder(encoderConfig)
+	// 为控制台输出启用颜色
+	encoderConfig.EncodeLevel = zapcore.CapitalColorLevelEncoder
 	consoleEncoder := zapcore.NewConsoleEncoder(encoderConfig)
 
 	// 根据配置创建Cores
@@ -40,7 +41,7 @@ func InitLogger(cfg models.LogConfig) {
 			Compress:   cfg.Compress,
 		}
 		fileWriter := zapcore.AddSync(lumberjackLogger)
-		cores = append(cores, zapcore.NewCore(jsonEncoder, fileWriter, logLevel))
+		cores = append(cores, zapcore.NewCore(consoleEncoder, fileWriter, logLevel))
 	}
 
 	if output == "console" || output == "both" {

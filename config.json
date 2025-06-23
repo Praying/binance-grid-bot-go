@@ -1,6 +1,4 @@
 {
-  "api_key": "",
-  "secret_key": "",
   "is_testnet": true,
   "live_api_url": "https://fapi.binance.com",
   "live_ws_url": "wss://fstream.binance.com",
@@ -17,7 +15,7 @@
   "return_rate": 0.15,
   "wallet_exposure_limit": 3.0,
   "log": {
-  	"level": "debug",
+  	"level": "info",
   	"output": "both",
   	"file": "logs/grid-bot.log",
   	"max_size": 10,
