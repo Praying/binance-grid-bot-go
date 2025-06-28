@@ -13,6 +13,8 @@ type Exchange interface {
 	PlaceOrder(symbol, side, orderType string, quantity, price float64) (*models.Order, error)
 	CancelOrder(symbol string, orderID int64) error
 	SetLeverage(symbol string, leverage int) error
+	SetPositionMode(isHedgeMode bool) error
+	SetMarginType(symbol string, marginType string) error
 	GetAccountInfo() (*models.AccountInfo, error)
 	CancelAllOpenOrders(symbol string) error
 	GetOrderStatus(symbol string, orderID int64) (*models.Order, error)

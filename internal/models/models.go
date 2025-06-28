@@ -16,11 +16,15 @@ type Config struct {
 	MinNotionalValue    float64   `json:"min_notional_value"`      // 新增: 交易所最小订单名义价值 (例如 5 USDT)
 	InitialInvestment   float64   `json:"initial_investment"`      // 初始投资额 (USDT), 用于市价买入
 	Leverage            int       `json:"leverage"`                // 杠杆倍数
+	MarginType          string    `json:"margin_type"`             // 保证金模式: CROSSED 或 ISOLATED
+	HedgeMode           bool      `json:"hedge_mode"`              // 是否开启对冲模式 (双向持仓)
 	GridCount           int       `json:"grid_count"`              // 网格数量（对）
 	ActiveOrdersCount   int       `json:"active_orders_count"`     // 在价格两侧各挂的订单数量
 	ReturnRate          float64   `json:"return_rate"`             // 预期回归价格比例
 	WalletExposureLimit float64   `json:"wallet_exposure_limit"`   // 新增：钱包风险暴露上限
 	LogConfig           LogConfig `json:"log"`                     // 新增：日志配置
+	RetryAttempts       int       `json:"retry_attempts"`          // 新增: 下单失败时的重试次数
+	RetryInitialDelayMs int       `json:"retry_initial_delay_ms"`  // 新增: 重试前的初始延迟毫秒数
 
 	// 回测引擎特定配置
 	TakerFeeRate          float64 `json:"taker_fee_rate"`          // 吃单手续费率

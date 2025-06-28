@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -272,10 +273,9 @@ func (b *GridTradingBot) enterMarketAndSetupGrid() error {
 	return nil
 }
 
-// placeNewOrder 是一个辅助函数，用于下单并将其添加到网格级别
-func (b *GridTradingBot) placeNewOrder(side string, price float64, gridID int) {
-	b.mutex.Lock()
-	defer b.mutex.Unlock()
+// placeNewOrder 是一个辅助函数，用于下单并将结果返回
+func (b *GridTradingBot) placeNewOrder(side string, price float64, gridID int) (*models.GridLevel, error) {
+	// 注意：此函数不再管理互斥锁，调用方需要负责线程安全
 
 	// 获取价格和数量的精度规则
 	var tickSize string
@@ -289,34 +289,32 @@ func (b *GridTradingBot) placeNewOrder(side string, price float64, gridID int) {
 	adjustedPrice := adjustValueToStep(price, tickSize)
 	quantity, err := b.calculateQuantity(adjustedPrice)
 	if err != nil {
-		logger.S().Errorf("在价格 %.4f 计算订单数量失败: %v", adjustedPrice, err)
-		return
+		return nil, fmt.Errorf("在价格 %.4f 计算订单数量失败: %v", adjustedPrice, err)
 	}
 	adjustedQuantity := quantity // calculateQuantity now returns the final adjusted quantity
 
 	// 在下买单前检查钱包风险暴露
 	if side == "BUY" {
 		if !b.isWithinExposureLimit(quantity) {
-			logger.S().Warnf("下单被阻止：钱包风险暴露将超过限制。")
-			return
+			return nil, fmt.Errorf("下单被阻止：钱包风险暴露将超过限制")
 		}
 	}
 
 	order, err := b.exchange.PlaceOrder(b.config.Symbol, side, "LIMIT", adjustedQuantity, adjustedPrice)
 	if err != nil {
-		logger.S().Errorf("下 %s 单失败，价格 %.4f: %v", side, adjustedPrice, err)
-		return
+		return nil, fmt.Errorf("下 %s 单失败，价格 %.4f: %v", side, adjustedPrice, err)
 	}
 
-	b.gridLevels = append(b.gridLevels, models.GridLevel{
+	newGridLevel := &models.GridLevel{
 		Price:    adjustedPrice,
 		Quantity: adjustedQuantity,
 		Side:     side,
-		IsActive: true, // All orders in this list are considered active
+		IsActive: true,
 		OrderID:  order.OrderId,
 		GridID:   gridID,
-	})
-	// logger.S().Infof("成功下 %s 单: ID %d, 价格 %.4f, 数量 %.5f", side, order.OrderId, adjustedPrice, adjustedQuantity)
+	}
+	logger.S().Infof("成功下 %s 单: ID %d, 价格 %.4f, 数量 %.5f, GridID: %d", side, order.OrderId, adjustedPrice, adjustedQuantity, gridID)
+	return newGridLevel, nil
 }
 
 // calculateQuantity 根据配置和交易所规则计算并验证订单数量
@@ -382,9 +380,7 @@ func (b *GridTradingBot) calculateQuantity(price float64) (float64, error) {
 
 // resetGridAroundPrice 是新的核心函数，用于在订单成交后重置网格
 func (b *GridTradingBot) resetGridAroundPrice(pivotGridID int, pivotSide string) {
-	b.mutex.Lock()
-	defer b.mutex.Unlock()
-
+	// 注意：这里的锁已被移除，以解决死锁问题。锁的管理已下放至各个下单goroutine内部。
 	logger.S().Infof("--- 基于GridID %d (%s) 重置网格 ---", pivotGridID, pivotSide)
 
 	// 1. 取消所有现有订单并清空本地列表
@@ -393,7 +389,9 @@ func (b *GridTradingBot) resetGridAroundPrice(pivotGridID int, pivotSide string)
 			logger.S().Warnf("重置网格时取消所有订单失败: %v", err)
 		}
 	}()
+	b.mutex.Lock()
 	b.gridLevels = make([]models.GridLevel, 0)
+	b.mutex.Unlock()
 
 	// 2. 直接根据 pivotGridID 和 pivotSide 计算新的挂单索引
 	sellStartIndex := -1
@@ -485,15 +483,61 @@ func (b *GridTradingBot) resetGridAroundPrice(pivotGridID int, pivotSide string)
 		}
 		logger.S().Debug("---------------------------------")
 
-		go func() {
-			// 注意：这里的 placeNewOrder 内部会再次计算数量，但这是必要的，
-			// 因为我们要确保下单时的计算是最新的，且能处理上面计算失败的情况。
-			// 此处的日志打印主要是为了调试和增加透明度。
-			for _, order := range ordersToPlace {
-				b.placeNewOrder(order.Side, order.Price, order.GridID)
-			}
-			logger.S().Info("--- 网格重置完成 ---")
-		}()
+		var wg sync.WaitGroup
+		concurrencyLimiter := make(chan struct{}, 6) // 限制并发数为6
+		successfulOrders := int32(0)
+		failedOrders := int32(0)
+
+		for _, order := range ordersToPlace {
+			wg.Add(1)
+			concurrencyLimiter <- struct{}{}
+
+			go func(o struct {
+				Side   string
+				Price  float64
+				GridID int
+			}) {
+				defer wg.Done()
+				defer func() { <-concurrencyLimiter }()
+
+				var err error
+				delay := time.Duration(b.config.RetryInitialDelayMs) * time.Millisecond
+				// 确保至少有1次尝试
+				attempts := b.config.RetryAttempts
+				if attempts <= 0 {
+					attempts = 1
+				}
+
+				for i := 0; i < attempts; i++ {
+					newGridLevel, err := b.placeNewOrder(o.Side, o.Price, o.GridID)
+					if err == nil {
+						// 成功下单，现在加锁以更新共享的 gridLevels 列表
+						b.mutex.Lock()
+						b.gridLevels = append(b.gridLevels, *newGridLevel)
+						b.mutex.Unlock()
+
+						atomic.AddInt32(&successfulOrders, 1)
+						return // 成功，退出goroutine
+					}
+
+					if i < attempts-1 {
+						logger.S().Warnf("下单失败 (尝试 %d/%d), GridID: %d, 价格: %.4f. 错误: %v. 将在 %v 后重试...",
+							i+1, attempts, o.GridID, o.Price, err, delay)
+						time.Sleep(delay)
+						delay *= 2 // 指数退避
+					}
+				}
+
+				// 所有重试均失败
+				logger.S().Errorf("严重: 订单在 %d 次尝试后彻底失败. GridID: %d, 价格: %.4f. 最后一次错误: %v",
+					attempts, o.GridID, o.Price, err)
+				atomic.AddInt32(&failedOrders, 1)
+			}(order)
+		}
+
+		wg.Wait()
+		logger.S().Infof("--- 网格重置下单流程完成 --- 成功: %d, 失败: %d", atomic.LoadInt32(&successfulOrders), atomic.LoadInt32(&failedOrders))
+
 	} else {
 		logger.S().Warn("没有新的订单需要挂载。")
 	}
@@ -772,10 +816,12 @@ func (b *GridTradingBot) Start() error {
 	b.mutex.Unlock()
 
 	// 3. 设置杠杆
+	logger.S().Infof("正在为 %s 设置杠杆为 %dx...", b.config.Symbol, b.config.Leverage)
 	if err := b.exchange.SetLeverage(b.config.Symbol, b.config.Leverage); err != nil {
-		// 在这里只打印警告，因为杠杆可能已经设置正确
-		logger.S().Warnf("设置杠杆失败: %v", err)
+		// 将其视为致命错误，因为错误的杠杆可能会导致严重的财务后果
+		return fmt.Errorf("设置杠杆失败: %v", err)
 	}
+	logger.S().Info("杠杆设置成功。")
 
 	// 4. 清理旧订单并开始新周期
 	logger.S().Info("正在取消所有历史挂单，以确保全新状态...")
@@ -875,11 +921,6 @@ func (b *GridTradingBot) ProcessBacktestTick() {
 	default:
 		// 通道中没有信号，什么也不做
 	}
-}
-
-// maintainGridOrders 已被 resetGridAroundPrice 替代，此函数留空或删除
-func (b *GridTradingBot) maintainGridOrders() {
-	// 该函数逻辑已被废弃
 }
 
 // SetCurrentPrice is used for backtesting

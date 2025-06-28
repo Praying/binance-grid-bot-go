@@ -492,6 +492,15 @@ func (e *BacktestExchange) SetLeverage(symbol string, leverage int) error {
 	e.Leverage = leverage
 	return nil
 }
+func (e *BacktestExchange) SetMarginType(symbol string, marginType string) error {
+	// 在回测中, 我们假设保证金模式已经根据配置设置好了, 此处无需操作
+	return nil
+}
+
+func (e *BacktestExchange) SetPositionMode(isHedgeMode bool) error {
+	// 在回测中, 我们假设持仓模式已经根据配置设置好了, 此处无需操作
+	return nil
+}
 func (e *BacktestExchange) GetAccountInfo() (*models.AccountInfo, error) { return nil, nil }
 func (e *BacktestExchange) GetAllOrders() []*models.Order {
 	e.mu.Lock()

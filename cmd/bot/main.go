@@ -156,6 +156,22 @@ func runLiveMode(cfg *models.Config) {
 	}
 	defer liveExchange.Close() // 确保在函数退出时关闭后台任务
 
+	// --- 初始化交易所设置 ---
+	logger.S().Info("正在初始化交易所设置...")
+	// 1. 设置持仓模式 (单向/双向)
+	if err := liveExchange.SetPositionMode(cfg.HedgeMode); err != nil {
+		logger.S().Fatalf("设置持仓模式失败: %v", err)
+	} else {
+		logger.S().Infof("持仓模式设置成功: HedgeMode=%v", cfg.HedgeMode)
+	}
+
+	// 2. 设置保证金模式 (全仓/逐仓)
+	if err := liveExchange.SetMarginType(cfg.Symbol, cfg.MarginType); err != nil {
+		logger.S().Fatalf("设置保证金模式失败: %v", err)
+	} else {
+		logger.S().Infof("保证金模式设置成功: %s", cfg.MarginType)
+	}
+
 	// 初始化机器人
 	gridBot := bot.NewGridTradingBot(cfg, liveExchange, false)
 

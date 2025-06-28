@@ -101,7 +101,7 @@ func (e *LiveExchange) syncTime() error {
 	e.timeOffset = offset
 	e.timeOffsetMutex.Unlock()
 
-	logger.S().Infof("[TimeSync] 时间同步完成。本地与服务器时间差: %d ms", offset)
+	logger.S().Debugf("[TimeSync] 时间同步完成。本地与服务器时间差: %d ms", offset)
 	return nil
 }
 
@@ -309,6 +309,35 @@ func (e *LiveExchange) SetLeverage(symbol string, leverage int) error {
 		"leverage": strconv.Itoa(leverage),
 	}
 	_, err := e.doRequest("POST", "/fapi/v1/leverage", params, true)
+	return err
+}
+
+// SetMarginType 设置指定交易对的保证金模式
+func (e *LiveExchange) SetMarginType(symbol string, marginType string) error {
+	params := map[string]string{
+		"symbol":     symbol,
+		"marginType": marginType,
+	}
+	_, err := e.doRequest("POST", "/fapi/v1/marginType", params, true)
+	// 忽略 "No need to change margin type" 错误
+	if err != nil && strings.Contains(err.Error(), "-4046") {
+		logger.S().Infof("保证金模式已经是 %s，无需更改。", marginType)
+		return nil
+	}
+	return err
+}
+
+// SetPositionMode 设置持仓模式（单向/双向）
+func (e *LiveExchange) SetPositionMode(isHedgeMode bool) error {
+	params := map[string]string{
+		"dualSidePosition": strconv.FormatBool(isHedgeMode),
+	}
+	_, err := e.doRequest("POST", "/fapi/v1/positionSide/dual", params, true)
+	// 忽略 "No need to change position side" 错误
+	if err != nil && strings.Contains(err.Error(), "-4059") {
+		logger.S().Infof("持仓模式无需更改。")
+		return nil
+	}
 	return err
 }
 
