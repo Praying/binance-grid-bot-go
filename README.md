@@ -2,7 +2,7 @@
 
 [![Go Version](https://img.shields.io/badge/Go-1.23+-blue.svg)](https://golang.org/dl/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
-[![Go Report Card](https://goreportcard.com/badge/github.com/your-username/binance-grid-bot-go)](https://goreportcard.com/report/github.com/your-username/binance-grid-bot-go)
+[![Go Report Card](https://goreportcard.com/badge/github.com/Praying/binance-grid-bot-go)](https://goreportcard.com/report/github.com/Praying/binance-grid-bot-go)
 
 A high-frequency grid trading bot for Binance Futures, written in Go. It supports both live trading and historical data backtesting to help you develop and verify your trading strategies.
 
