@@ -3,7 +3,7 @@ module binance-grid-bot-go
 go 1.23
 
 require (
-	github.com/adshao/go-binance/v2 v2.8.2
+	github.com/adshao/go-binance/v2 v2.8.3
 	github.com/gorilla/websocket v1.5.3
 	github.com/jedib0t/go-pretty/v6 v6.6.7
 	github.com/joho/godotenv v1.5.1
