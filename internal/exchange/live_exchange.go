@@ -269,12 +269,13 @@ func (e *LiveExchange) GetPrice(symbol string) (float64, error) {
 }
 
 // PlaceOrder 下单
-func (e *LiveExchange) PlaceOrder(symbol, side, orderType string, quantity, price float64) (*models.Order, error) {
+func (e *LiveExchange) PlaceOrder(symbol, side, orderType string, quantity, price float64, clientOrderID string) (*models.Order, error) {
 	params := map[string]string{
-		"symbol":   symbol,
-		"side":     side,
-		"type":     orderType,
-		"quantity": strconv.FormatFloat(quantity, 'f', -1, 64),
+		"symbol":           symbol,
+		"side":             side,
+		"type":             orderType,
+		"quantity":         strconv.FormatFloat(quantity, 'f', -1, 64),
+		"newClientOrderId": clientOrderID,
 	}
 
 	if orderType == "LIMIT" {

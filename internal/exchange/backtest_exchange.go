@@ -434,18 +434,19 @@ func (e *BacktestExchange) GetPrice(symbol string) (float64, error) {
 	return e.CurrentPrice, nil
 }
 
-func (e *BacktestExchange) PlaceOrder(symbol, side, orderType string, quantity, price float64) (*models.Order, error) {
+func (e *BacktestExchange) PlaceOrder(symbol, side, orderType string, quantity, price float64, clientOrderID string) (*models.Order, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	order := &models.Order{
-		OrderId: e.NextOrderID,
-		Symbol:  e.Symbol, // 强制使用交易所内部的 symbol
-		Side:    side,
-		Type:    orderType,
-		OrigQty: fmt.Sprintf("%.8f", quantity),
-		Price:   fmt.Sprintf("%.8f", price),
-		Status:  "NEW",
+		OrderId:       e.NextOrderID,
+		ClientOrderId: clientOrderID, // 存储 clientOrderID
+		Symbol:        e.Symbol,      // 强制使用交易所内部的 symbol
+		Side:          side,
+		Type:          orderType,
+		OrigQty:       fmt.Sprintf("%.8f", quantity),
+		Price:         fmt.Sprintf("%.8f", price),
+		Status:        "NEW",
 	}
 	e.orders[order.OrderId] = order
 	e.NextOrderID++

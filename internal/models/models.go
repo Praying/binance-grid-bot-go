@@ -9,22 +9,24 @@ type Config struct {
 	LiveWSURL           string    `json:"live_ws_url"`
 	TestnetAPIURL       string    `json:"testnet_api_url"`
 	TestnetWSURL        string    `json:"testnet_ws_url"`
-	Symbol              string    `json:"symbol"`                  // 交易对，如 "BTCUSDT"
-	GridSpacing         float64   `json:"grid_spacing"`            // 网格间距比例
-	GridValue           float64   `json:"grid_value,omitempty"`    // 每个网格的交易价值 (USDT)
-	GridQuantity        float64   `json:"grid_quantity,omitempty"` // 新增：每个网格的交易数量（基础货币）
-	MinNotionalValue    float64   `json:"min_notional_value"`      // 新增: 交易所最小订单名义价值 (例如 5 USDT)
-	InitialInvestment   float64   `json:"initial_investment"`      // 初始投资额 (USDT), 用于市价买入
-	Leverage            int       `json:"leverage"`                // 杠杆倍数
-	MarginType          string    `json:"margin_type"`             // 保证金模式: CROSSED 或 ISOLATED
-	HedgeMode           bool      `json:"hedge_mode"`              // 是否开启对冲模式 (双向持仓)
-	GridCount           int       `json:"grid_count"`              // 网格数量（对）
-	ActiveOrdersCount   int       `json:"active_orders_count"`     // 在价格两侧各挂的订单数量
-	ReturnRate          float64   `json:"return_rate"`             // 预期回归价格比例
-	WalletExposureLimit float64   `json:"wallet_exposure_limit"`   // 新增：钱包风险暴露上限
-	LogConfig           LogConfig `json:"log"`                     // 新增：日志配置
-	RetryAttempts       int       `json:"retry_attempts"`          // 新增: 下单失败时的重试次数
-	RetryInitialDelayMs int       `json:"retry_initial_delay_ms"`  // 新增: 重试前的初始延迟毫秒数
+	Symbol              string    `json:"symbol"`                   // 交易对，如 "BTCUSDT"
+	GridSpacing         float64   `json:"grid_spacing"`             // 网格间距比例
+	GridValue           float64   `json:"grid_value,omitempty"`     // 每个网格的交易价值 (USDT)
+	GridQuantity        float64   `json:"grid_quantity,omitempty"`  // 新增：每个网格的交易数量（基础货币）
+	MinNotionalValue    float64   `json:"min_notional_value"`       // 新增: 交易所最小订单名义价值 (例如 5 USDT)
+	InitialInvestment   float64   `json:"initial_investment"`       // 初始投资额 (USDT), 用于市价买入
+	Leverage            int       `json:"leverage"`                 // 杠杆倍数
+	MarginType          string    `json:"margin_type"`              // 保证金模式: CROSSED 或 ISOLATED
+	PositionMode        string    `json:"position_mode"`            // 新增: 持仓模式, "Oneway" 或 "Hedge"
+	StopLossRate        float64   `json:"stop_loss_rate,omitempty"` // 新增: 止损率
+	HedgeMode           bool      `json:"hedge_mode"`               // 是否开启对冲模式 (双向持仓)
+	GridCount           int       `json:"grid_count"`               // 网格数量（对）
+	ActiveOrdersCount   int       `json:"active_orders_count"`      // 在价格两侧各挂的订单数量
+	ReturnRate          float64   `json:"return_rate"`              // 预期回归价格比例
+	WalletExposureLimit float64   `json:"wallet_exposure_limit"`    // 新增：钱包风险暴露上限
+	LogConfig           LogConfig `json:"log"`                      // 新增：日志配置
+	RetryAttempts       int       `json:"retry_attempts"`           // 新增: 下单失败时的重试次数
+	RetryInitialDelayMs int       `json:"retry_initial_delay_ms"`   // 新增: 重试前的初始延迟毫秒数
 
 	// 回测引擎特定配置
 	TakerFeeRate          float64 `json:"taker_fee_rate"`          // 吃单手续费率
@@ -182,4 +184,26 @@ type Trade struct {
 	PositionSide    string `json:"positionSide"`
 	Buyer           bool   `json:"buyer"`
 	Maker           bool   `json:"maker"`
+}
+
+// TradeEvent 定义了来自 WebSocket 的交易事件
+type TradeEvent struct {
+	EventType string `json:"e"` // Event type
+	EventTime int64  `json:"E"` // Event time
+	Symbol    string `json:"s"` // Symbol
+	TradeID   int64  `json:"a"` // Aggregate trade ID
+	Price     string `json:"p"` // Price
+	Quantity  string `json:"q"` // Quantity
+	FirstID   int64  `json:"f"` // First trade ID
+	LastID    int64  `json:"l"` // Last trade ID
+	TradeTime int64  `json:"T"` // Trade time
+	IsMaker   bool   `json:"m"` // Is the buyer the market maker?
+}
+
+// BotState 定义了需要保存和加载的机器人状态
+type BotState struct {
+	GridLevels     []GridLevel `json:"grid_levels"`
+	EntryPrice     float64     `json:"entry_price"`
+	ReversionPrice float64     `json:"reversion_price"`
+	ConceptualGrid []float64   `json:"conceptual_grid"`
 }

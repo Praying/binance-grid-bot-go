@@ -10,7 +10,7 @@ import (
 type Exchange interface {
 	GetPrice(symbol string) (float64, error)
 	GetPositions(symbol string) ([]models.Position, error)
-	PlaceOrder(symbol, side, orderType string, quantity, price float64) (*models.Order, error)
+	PlaceOrder(symbol, side, orderType string, quantity, price float64, clientOrderID string) (*models.Order, error)
 	CancelOrder(symbol string, orderID int64) error
 	SetLeverage(symbol string, leverage int) error
 	SetPositionMode(isHedgeMode bool) error
