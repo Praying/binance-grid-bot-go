@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/jedib0t/go-pretty/v6/table"
 )
 
@@ -487,8 +488,23 @@ func (e *BacktestExchange) IsLiquidated() bool {
 	defer e.mu.Unlock()
 	return e.isLiquidated
 }
-func (e *BacktestExchange) GetPositions(symbol string) ([]models.Position, error) { return nil, nil }
-func (e *BacktestExchange) CancelOrder(symbol string, orderID int64) error        { return nil }
+func (e *BacktestExchange) GetPositions(symbol string) ([]models.Position, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if posSize, ok := e.Positions[symbol]; ok && posSize > 0 {
+		avgPrice := e.AvgEntryPrice[symbol]
+		return []models.Position{
+			{
+				Symbol:      symbol,
+				PositionAmt: fmt.Sprintf("%f", posSize),
+				EntryPrice:  fmt.Sprintf("%f", avgPrice),
+			},
+		}, nil
+	}
+	return []models.Position{}, nil
+}
+func (e *BacktestExchange) CancelOrder(symbol string, orderID int64) error { return nil }
 func (e *BacktestExchange) SetLeverage(symbol string, leverage int) error {
 	e.Leverage = leverage
 	return nil
@@ -497,61 +513,58 @@ func (e *BacktestExchange) SetMarginType(symbol string, marginType string) error
 	// 在回测中, 我们假设保证金模式已经根据配置设置好了, 此处无需操作
 	return nil
 }
-
 func (e *BacktestExchange) SetPositionMode(isHedgeMode bool) error {
 	// 在回测中, 我们假设持仓模式已经根据配置设置好了, 此处无需操作
 	return nil
 }
-func (e *BacktestExchange) GetAccountInfo() (*models.AccountInfo, error) { return nil, nil }
+
+// GetPositionMode 在回测中返回一个固定的值，因为这通常不影响回测逻辑。
+func (e *BacktestExchange) GetPositionMode() (bool, error) {
+	// 假设回测环境总是使用双向持仓模式，或者可以从配置中读取
+	return true, nil
+}
+
 func (e *BacktestExchange) GetAllOrders() []*models.Order {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-
-	orders := make([]*models.Order, 0, len(e.orders))
+	var allOrders []*models.Order
 	for _, order := range e.orders {
-		orderCopy := *order
-		orders = append(orders, &orderCopy)
+		allOrders = append(allOrders, order)
 	}
-	return orders
+	return allOrders
 }
-
 func (e *BacktestExchange) GetCurrentTime() time.Time {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.CurrentTime
 }
 
-// GetAccountState 获取回测环境中的账户状态
+// GetAccountState 获取回测账户的状态
 func (e *BacktestExchange) GetAccountState(symbol string) (positionValue float64, accountEquity float64, err error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	positionSize := e.Positions[symbol]
 	positionValue = positionSize * e.CurrentPrice
-
-	if len(e.EquityCurve) > 0 {
-		accountEquity = e.EquityCurve[len(e.EquityCurve)-1]
-	} else {
-		accountEquity = e.InitialBalance
-	}
+	accountEquity = e.Cash + e.Margin + e.UnrealizedPNL
 
 	return positionValue, accountEquity, nil
 }
 
-// GetSymbolInfo 为回测提供一个模拟的交易规则
+// GetSymbolInfo 返回一个模拟的交易规则，以满足机器人启动时的需求
 func (e *BacktestExchange) GetSymbolInfo(symbol string) (*models.SymbolInfo, error) {
-	// 对于回测，我们返回一个包含合理默认值的模拟 SymbolInfo
-	// 这避免了在回测模式下进行网络调用
+	// 返回一个合理的默认值，特别是 tickSize 和 stepSize
 	return &models.SymbolInfo{
 		Symbol: symbol,
 		Filters: []models.Filter{
 			{
 				FilterType: "PRICE_FILTER",
-				TickSize:   "0.01", // 假设价格精度为2位小数
+				TickSize:   "0.01", // 假设价格精度为 0.01
 			},
 			{
 				FilterType: "LOT_SIZE",
-				StepSize:   "0.001", // 假设数量精度为3位小数
+				StepSize:   "0.001", // 假设数量精度为 0.001
+				MinQty:     "0.001",
 			},
 			{
 				FilterType:  "MIN_NOTIONAL",
@@ -561,13 +574,11 @@ func (e *BacktestExchange) GetSymbolInfo(symbol string) (*models.SymbolInfo, err
 	}, nil
 }
 
-// GetOpenOrders 为回测提供一个模拟的实现
+// GetOpenOrders 获取所有未成交的订单
 func (e *BacktestExchange) GetOpenOrders(symbol string) ([]models.Order, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-
-	// 在回测中，我们自己管理订单状态，可以直接从业已存在的订单map中筛选
-	openOrders := make([]models.Order, 0)
+	var openOrders []models.Order
 	for _, order := range e.orders {
 		if order.Symbol == symbol && order.Status == "NEW" {
 			openOrders = append(openOrders, *order)
@@ -576,51 +587,112 @@ func (e *BacktestExchange) GetOpenOrders(symbol string) ([]models.Order, error) 
 	return openOrders, nil
 }
 
-// GetServerTime 为回测提供一个模拟的实现
+// GetServerTime 模拟获取服务器时间
 func (e *BacktestExchange) GetServerTime() (int64, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	// 在回测中，服务器时间就是当前数据点的时间
 	return e.CurrentTime.UnixMilli(), nil
 }
 
-// GetDailyEquity 返回每日权益的只读副本
+// GetDailyEquity 返回每日权益记录
 func (e *BacktestExchange) GetDailyEquity() map[string]float64 {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	// 返回一个副本以防止外部修改
-	cpy := make(map[string]float64)
+	// 返回一个副本以确保线程安全
+	dailyEquityCopy := make(map[string]float64)
 	for k, v := range e.dailyEquity {
-		cpy[k] = v
+		dailyEquityCopy[k] = v
 	}
-	return cpy
+	return dailyEquityCopy
 }
 
-// GetMaxWalletExposure 返回回测期间记录的最大钱包风险暴露。
+// GetMaxWalletExposure 返回回测期间记录的最大钱包风险暴露
 func (e *BacktestExchange) GetMaxWalletExposure() float64 {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.MaxWalletExposure
 }
 
-// GetLastTrade 在回测中模拟获取最新成交记录。
+// GetLastTrade 模拟获取最新成交
 func (e *BacktestExchange) GetLastTrade(symbol string, orderID int64) (*models.Trade, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
+	// 在回测中，我们没有真实的成交列表。
+	// 我们需要从订单信息中构建一个模拟的成交回报。
 	order, ok := e.orders[orderID]
-	if !ok {
-		return nil, fmt.Errorf("在回测中未找到订单 ID %d", orderID)
+	if !ok || order.Status != "FILLED" {
+		return nil, fmt.Errorf("未找到已成交的订单 %d", orderID)
 	}
 
-	// 在回测模式下，我们假设成交价就是订单的挂单价
-	// 我们可以创建一个模拟的 Trade 对象返回
+	// 模拟一个成交记录
 	return &models.Trade{
-		Symbol:  order.Symbol,
-		OrderID: order.OrderId,
-		Side:    order.Side,
-		Price:   order.Price, // 使用订单价格作为成交价
-		Qty:     order.OrigQty,
-		Time:    e.CurrentTime.UnixMilli(),
+		Symbol: order.Symbol,
+		Price:  order.Price, // 使用订单价格作为成交价
+		Qty:    order.OrigQty,
+		Time:   e.CurrentTime.UnixMilli(),
 	}, nil
+}
+
+// CreateListenKey 是一个虚拟实现，以满足 Exchange 接口的要求。
+func (e *BacktestExchange) CreateListenKey() (string, error) {
+	return "dummy-listen-key-for-backtest", nil
+}
+
+// KeepAliveListenKey 是一个虚拟实现，以满足 Exchange 接口的要求。
+func (e *BacktestExchange) KeepAliveListenKey(listenKey string) error {
+	return nil
+}
+
+// GetBalance 返回回测环境中的现金余额
+func (e *BacktestExchange) GetBalance() (float64, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.Cash, nil
+}
+
+// GetAccountInfo 模拟获取账户信息
+func (e *BacktestExchange) GetAccountInfo() (*models.AccountInfo, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	equity := e.Cash + e.Margin + e.UnrealizedPNL
+
+	// 创建一个模拟的 AccountInfo 结构
+	// 我们只填充那些在回测中有意义且可用的字段
+	info := &models.AccountInfo{
+		TotalWalletBalance: fmt.Sprintf("%f", equity),
+		AvailableBalance:   fmt.Sprintf("%f", e.Cash), // 可用余额等于现金
+		Assets: []struct {
+			Asset                  string `json:"asset"`
+			WalletBalance          string `json:"walletBalance"`
+			UnrealizedProfit       string `json:"unrealizedProfit"`
+			MarginBalance          string `json:"marginBalance"`
+			MaintMargin            string `json:"maintMargin"`
+			InitialMargin          string `json:"initialMargin"`
+			PositionInitialMargin  string `json:"positionInitialMargin"`
+			OpenOrderInitialMargin string `json:"openOrderInitialMargin"`
+			MaxWithdrawAmount      string `json:"maxWithdrawAmount"`
+		}{
+			{
+				Asset:                  "USDT", // 假设主要资产是 USDT
+				WalletBalance:          fmt.Sprintf("%f", equity),
+				UnrealizedProfit:       fmt.Sprintf("%f", e.UnrealizedPNL),
+				MarginBalance:          fmt.Sprintf("%f", e.Cash+e.Margin), // 保证金余额
+				MaintMargin:            "0",                                // 简化，不计算维持保证金
+				InitialMargin:          fmt.Sprintf("%f", e.Margin),
+				PositionInitialMargin:  fmt.Sprintf("%f", e.Margin),
+				OpenOrderInitialMargin: "0", // 简化，不计算挂单保证金
+				MaxWithdrawAmount:      fmt.Sprintf("%f", e.Cash),
+			},
+		},
+	}
+
+	return info, nil
+}
+
+// ConnectWebSocket 在回测中是一个空操作
+func (e *BacktestExchange) ConnectWebSocket(listenKey string) (*websocket.Conn, error) {
+	// 回测模式下不建立真实的 WebSocket 连接
+	return nil, nil
 }

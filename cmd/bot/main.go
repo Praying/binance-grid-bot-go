@@ -150,19 +150,37 @@ func runLiveMode(cfg *models.Config) {
 	cfg.WSBaseURL = wsBaseURL
 
 	// 初始化交易所
-	liveExchange, err := exchange.NewLiveExchange(apiKey, secretKey, cfg.BaseURL)
+	liveExchange, err := exchange.NewLiveExchange(apiKey, secretKey, cfg.BaseURL, cfg.WSBaseURL, logger.L())
 	if err != nil {
 		logger.S().Fatalf("初始化交易所失败: %v", err)
 	}
-	defer liveExchange.Close() // 确保在函数退出时关闭后台任务
 
 	// --- 初始化交易所设置 ---
 	logger.S().Info("正在初始化交易所设置...")
+
 	// 1. 设置持仓模式 (单向/双向)
-	if err := liveExchange.SetPositionMode(cfg.HedgeMode); err != nil {
-		logger.S().Fatalf("设置持仓模式失败: %v", err)
+	// --- 隔离测试：调用另一个需要签名的GET接口来验证签名逻辑 ---
+	logger.S().Info("[调试] 正在调用 GetAccountInfo 来测试签名...")
+	if _, err := liveExchange.GetAccountInfo(); err != nil {
+		logger.S().Fatalf("[调试] 调用 GetAccountInfo 失败: %v", err)
+	}
+	logger.S().Info("[调试] 调用 GetAccountInfo 成功！签名逻辑可能没有问题。")
+	// --- 测试结束 ---
+
+	// 1. 设置持仓模式 (单向/双向)
+	currentHedgeMode, err := liveExchange.GetPositionMode()
+	if err != nil {
+		logger.S().Fatalf("获取当前持仓模式失败: %v", err)
+	}
+
+	if currentHedgeMode != cfg.HedgeMode {
+		logger.S().Infof("当前持仓模式 (HedgeMode=%v) 与配置 (HedgeMode=%v) 不符，正在尝试更新...", currentHedgeMode, cfg.HedgeMode)
+		if err := liveExchange.SetPositionMode(cfg.HedgeMode); err != nil {
+			logger.S().Fatalf("设置持仓模式失败: %v", err)
+		}
+		logger.S().Infof("持仓模式成功更新为: HedgeMode=%v", cfg.HedgeMode)
 	} else {
-		logger.S().Infof("持仓模式设置成功: HedgeMode=%v", cfg.HedgeMode)
+		logger.S().Infof("当前持仓模式已是目标模式 (HedgeMode=%v)，无需更改。", cfg.HedgeMode)
 	}
 
 	// 2. 设置保证金模式 (全仓/逐仓)

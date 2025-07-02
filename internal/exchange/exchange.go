@@ -3,6 +3,8 @@ package exchange
 import (
 	"binance-grid-bot-go/internal/models"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 // Exchange 定义了所有交易所实现必须提供的通用方法。
@@ -14,6 +16,7 @@ type Exchange interface {
 	CancelOrder(symbol string, orderID int64) error
 	SetLeverage(symbol string, leverage int) error
 	SetPositionMode(isHedgeMode bool) error
+	GetPositionMode() (bool, error)
 	SetMarginType(symbol string, marginType string) error
 	GetAccountInfo() (*models.AccountInfo, error)
 	CancelAllOpenOrders(symbol string) error
@@ -26,4 +29,8 @@ type Exchange interface {
 	GetServerTime() (int64, error)                       // 新增：获取服务器时间
 	GetLastTrade(symbol string, orderID int64) (*models.Trade, error)
 	GetMaxWalletExposure() float64
+	CreateListenKey() (string, error)
+	KeepAliveListenKey(listenKey string) error
+	GetBalance() (float64, error)
+	ConnectWebSocket(listenKey string) (*websocket.Conn, error)
 }

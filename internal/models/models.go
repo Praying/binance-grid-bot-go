@@ -1,6 +1,9 @@
 package models
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 // Config 结构体定义了机器人的所有配置参数
 type Config struct {
@@ -200,10 +203,64 @@ type TradeEvent struct {
 	IsMaker   bool   `json:"m"` // Is the buyer the market maker?
 }
 
+// UserDataEvent 是从用户数据流接收到的通用事件结构
+type UserDataEvent struct {
+	EventType string `json:"e"` // Event type, e.g., "executionReport"
+	EventTime int64  `json:"E"` // Event time
+	// 根据事件类型，这里可以包含不同的负载
+	ExecutionReport ExecutionReport `json:"o"`
+}
+
+// ExecutionReport 包含了订单更新的详细信息
+type ExecutionReport struct {
+	Symbol        string `json:"s"`  // Symbol
+	ClientOrderID string `json:"c"`  // Client Order ID
+	Side          string `json:"S"`  // Side
+	OrderType     string `json:"o"`  // Order Type
+	TimeInForce   string `json:"f"`  // Time in Force
+	OrigQty       string `json:"q"`  // Original Quantity
+	Price         string `json:"p"`  // Price
+	AvgPrice      string `json:"ap"` // Average Price
+	StopPrice     string `json:"sp"` // Stop Price
+	ExecType      string `json:"x"`  // Execution Type
+	OrderStatus   string `json:"X"`  // Order Status
+	OrderID       int64  `json:"i"`  // Order ID
+	ExecutedQty   string `json:"l"`  // Last Executed Quantity
+	CumQty        string `json:"z"`  // Cumulative Filled Quantity
+	ExecutedPrice string `json:"L"`  // Last Executed Price
+	CommissionAmt string `json:"n"`  // Commission Amount
+	CommissionAs  string `json:"N"`  // Commission Asset
+	TradeTime     int64  `json:"T"`  // Trade Time
+	TradeID       int64  `json:"t"`  // Trade ID
+}
+
 // BotState 定义了需要保存和加载的机器人状态
 type BotState struct {
-	GridLevels     []GridLevel `json:"grid_levels"`
-	EntryPrice     float64     `json:"entry_price"`
-	ReversionPrice float64     `json:"reversion_price"`
-	ConceptualGrid []float64   `json:"conceptual_grid"`
+	GridLevels              []GridLevel `json:"grid_levels"`
+	BasePositionEstablished bool        `json:"base_position_established"`
+	ConceptualGrid          []float64   `json:"conceptual_grid"`
+	EntryPrice              float64     `json:"entry_price"`
+	ReversionPrice          float64     `json:"reversion_price"`
+	IsReentering            bool        `json:"is_reentering"`
+	CurrentPrice            float64     `json:"current_price"`
+	CurrentTime             time.Time   `json:"current_time"`
+}
+
+// Balance 定义了账户中特定资产的余额信息
+type Balance struct {
+	Asset              string `json:"asset"`
+	Balance            string `json:"balance"`
+	CrossWalletBalance string `json:"crossWalletBalance"`
+	AvailableBalance   string `json:"availableBalance"`
+}
+
+// Error 定义了币安API返回的错误信息结构
+type Error struct {
+	Code int    `json:"code"`
+	Msg  string `json:"msg"`
+}
+
+// Error 方法使得 BinanceError 实现了 error 接口
+func (e *Error) Error() string {
+	return fmt.Sprintf("API Error: code=%d, msg=%s", e.Code, e.Msg)
 }

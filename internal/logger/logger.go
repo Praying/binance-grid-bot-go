@@ -10,7 +10,10 @@ import (
 	"gopkg.in/natefinch/lumberjack.v2"
 )
 
-var sugaredLogger *zap.SugaredLogger
+var (
+	logger        *zap.Logger
+	sugaredLogger *zap.SugaredLogger
+)
 
 // InitLogger 初始化zap日志记录器
 func InitLogger(cfg models.LogConfig) {
@@ -60,7 +63,7 @@ func InitLogger(cfg models.LogConfig) {
 	core := zapcore.NewTee(cores...)
 
 	// 创建logger
-	logger := zap.New(core, zap.AddCaller())
+	logger = zap.New(core, zap.AddCaller())
 	sugaredLogger = logger.Sugar()
 }
 
@@ -68,8 +71,18 @@ func InitLogger(cfg models.LogConfig) {
 func S() *zap.SugaredLogger {
 	if sugaredLogger == nil {
 		// 如果logger未初始化，则提供一个默认的应急logger
-		logger, _ := zap.NewDevelopment()
-		return logger.Sugar()
+		defaultLogger, _ := zap.NewDevelopment()
+		return defaultLogger.Sugar()
 	}
 	return sugaredLogger
+}
+
+// L 返回全局的 logger 实例
+func L() *zap.Logger {
+	if logger == nil {
+		// 如果logger未初始化，则提供一个默认的应急logger
+		defaultLogger, _ := zap.NewDevelopment()
+		return defaultLogger
+	}
+	return logger
 }
