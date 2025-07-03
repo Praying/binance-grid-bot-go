@@ -15,6 +15,7 @@ require (
 	github.com/bitly/go-simplejson v0.5.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/jpillora/backoff v1.0.0 // indirect
+	github.com/jxskiss/base62 v1.1.0 // indirect
 	github.com/mattn/go-runewidth v0.0.16 // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/shopspring/decimal v1.4.0 // indirect

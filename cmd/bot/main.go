@@ -126,7 +126,6 @@ func handleBacktestMode(symbol, startDate, endDate, dataPath string) (string, er
 // runLiveMode 运行实时交易机器人
 func runLiveMode(cfg *models.Config) {
 	logger.S().Info("--- 启动实时交易模式 ---")
-	stateFilePath := "grid_state.json"
 
 	// 从环境变量加载API密钥
 	apiKey := os.Getenv("BINANCE_API_KEY")
@@ -202,10 +201,7 @@ func runLiveMode(cfg *models.Config) {
 	// 初始化机器人
 	gridBot := bot.NewGridTradingBot(cfg, liveExchange, false)
 
-	// 加载状态
-	if err := gridBot.LoadState(stateFilePath); err != nil {
-		logger.S().Warnf("无法加载状态: %v，将以全新状态启动。", err)
-	}
+	// 状态加载逻辑已移至 bot.Start() 内部
 
 	// 启动机器人
 	if err := gridBot.Start(); err != nil {
@@ -217,12 +213,9 @@ func runLiveMode(cfg *models.Config) {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 
-	// 停止机器人并保存状态
+	// 停止机器人, 状态保存逻辑已移至 bot.Stop() 内部
 	gridBot.Stop()
-	if err := gridBot.SaveState(stateFilePath); err != nil {
-		logger.S().Fatalf("保存状态失败: %v", err)
-	}
-	logger.S().Info("机器人已成功停止，状态已保存。")
+	logger.S().Info("机器人已成功停止。")
 }
 
 // runBacktestMode 运行回测模式

@@ -390,9 +390,8 @@ func (e *LiveExchange) GetAccountState(symbol string) (positionValue float64, ac
 
 // GetSymbolInfo 获取交易对的交易规则
 func (e *LiveExchange) GetSymbolInfo(symbol string) (*models.SymbolInfo, error) {
-	params := url.Values{}
-	params.Set("symbol", symbol)
-	data, err := e.doRequest("GET", "/fapi/v1/exchangeInfo", params, false)
+	// 【关键修复】获取交易所信息时不应传递任何参数，以获取所有交易对的完整列表
+	data, err := e.doRequest("GET", "/fapi/v1/exchangeInfo", nil, false)
 	if err != nil {
 		return nil, err
 	}

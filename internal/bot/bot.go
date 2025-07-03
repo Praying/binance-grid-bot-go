@@ -2,6 +2,7 @@ package bot
 
 import (
 	"binance-grid-bot-go/internal/exchange"
+	"binance-grid-bot-go/internal/idgenerator"
 	"binance-grid-bot-go/internal/logger"
 	"binance-grid-bot-go/internal/models"
 	"encoding/json"
@@ -36,8 +37,9 @@ type GridTradingBot struct {
 	reentrySignal           chan bool // 新增：用于解耦再入场信号的通道
 	mutex                   sync.RWMutex
 	stopChannel             chan bool
-	symbolInfo              *models.SymbolInfo // 缓存交易规则
-	isHalted                bool               // 新增：标记机器人是否因无法交易而暂停
+	symbolInfo              *models.SymbolInfo       // 缓存交易规则
+	isHalted                bool                     // 新增：标记机器人是否因无法交易而暂停
+	idGenerator             *idgenerator.IDGenerator // 新增：全局唯一的ID生成器
 }
 
 // NewGridTradingBot 创建一个新的网格交易机器人实例
@@ -62,12 +64,23 @@ func NewGridTradingBot(config *models.Config, ex exchange.Exchange, isBacktest b
 	bot.symbolInfo = symbolInfo
 	logger.S().Infof("成功获取并缓存了 %s 的交易规则。", config.Symbol)
 
+	// 初始化ID生成器 (instanceID 0 是临时的，未来可以从配置或服务中获取)
+	idGen, err := idgenerator.NewIDGenerator(0)
+	if err != nil {
+		// 这是一个致命错误，因为没有ID生成器机器人无法工作
+		logger.S().Fatalf("无法创建ID生成器: %v", err)
+	}
+	bot.idGenerator = idGen
+
 	return bot
 }
 
 // establishBasePositionAndWait 尝试建立初始底仓并阻塞等待其成交，成功后返回成交价
 func (b *GridTradingBot) establishBasePositionAndWait(quantity float64) (float64, error) {
-	clientOrderID := b.generateClientOrderID("base")
+	clientOrderID, err := b.generateClientOrderID()
+	if err != nil {
+		return 0, fmt.Errorf("无法为初始订单生成ID: %v", err)
+	}
 	order, err := b.exchange.PlaceOrder(b.config.Symbol, "BUY", "MARKET", quantity, 0, clientOrderID)
 	if err != nil {
 		return 0, fmt.Errorf("初始市价买入失败: %v", err)
@@ -302,7 +315,10 @@ func (b *GridTradingBot) placeNewOrder(side string, price float64, gridID int) (
 
 	// --- 下单并轮询确认 ---
 	// 1. 下单
-	clientOrderID := b.generateClientOrderID(fmt.Sprintf("grid%d", gridID))
+	clientOrderID, err := b.generateClientOrderID()
+	if err != nil {
+		return nil, fmt.Errorf("无法为网格订单 (GridID: %d) 生成ID: %v", gridID, err)
+	}
 	order, err := b.exchange.PlaceOrder(b.config.Symbol, side, "LIMIT", adjustedQuantity, adjustedPrice, clientOrderID)
 	if err != nil {
 		return nil, fmt.Errorf("下 %s 单失败，价格 %.4f: %v", side, adjustedPrice, err)
@@ -411,11 +427,22 @@ func (b *GridTradingBot) calculateQuantity(price float64) (float64, error) {
 
 	// 6. 最后再次检查调整后的数量是否小于最小量 (因为向下取整可能导致此问题)
 	if adjustedQuantity < minQtyValue {
-		// 如果向下取整后小于最小量，则需要增加一个步进
 		step, _ := strconv.ParseFloat(stepSize, 64)
-		adjustedQuantity += step
-		// 再次调整以防万一
-		adjustedQuantity = adjustValueToStep(adjustedQuantity, stepSize)
+		if step > 0 {
+			adjustedQuantity += step
+			adjustedQuantity = adjustValueToStep(adjustedQuantity, stepSize) // 再次调整
+		}
+	}
+
+	// 7. 【关键修复】在所有调整完成后，最后再验证一次名义价值
+	if price*adjustedQuantity < minNotionalValue {
+		step, _ := strconv.ParseFloat(stepSize, 64)
+		if step > 0 {
+			// 增加一个步进单位，以确保超过最小名义价值
+			adjustedQuantity += step
+			// 再次进行精度调整
+			adjustedQuantity = adjustValueToStep(adjustedQuantity, stepSize)
+		}
 	}
 
 	return adjustedQuantity, nil
@@ -427,11 +454,11 @@ func (b *GridTradingBot) resetGridAroundPrice(pivotGridID int, pivotSide string)
 	logger.S().Infof("--- 基于GridID %d (%s) 重置网格 ---", pivotGridID, pivotSide)
 
 	// 1. 取消所有现有订单并清空本地列表
-	go func() {
-		if err := b.exchange.CancelAllOpenOrders(b.config.Symbol); err != nil {
-			logger.S().Warnf("重置网格时取消所有订单失败: %v", err)
-		}
-	}()
+	if err := b.exchange.CancelAllOpenOrders(b.config.Symbol); err != nil {
+		logger.S().Warnf("重置网格时取消所有订单失败: %v", err)
+	}
+	time.Sleep(500 * time.Millisecond) // 等待交易所处理
+
 	b.mutex.Lock()
 	b.gridLevels = make([]models.GridLevel, 0)
 	b.mutex.Unlock()
@@ -507,12 +534,12 @@ func (b *GridTradingBot) resetGridAroundPrice(pivotGridID int, pivotSide string)
 				GridID int
 			}) {
 				defer wg.Done()
-				newLevel, err := b.placeNewOrder(o.Side, o.Price, o.GridID)
+				newGrid, err := b.placeNewOrder(o.Side, o.Price, o.GridID)
 				if err != nil {
-					logger.S().Errorf("挂单失败 (GridID: %d, Price: %.4f): %v", o.GridID, o.Price, err)
-				} else if newLevel != nil {
+					logger.S().Errorf("重置网格时下单失败 (GridID: %d, Price: %.4f): %v", o.GridID, o.Price, err)
+				} else {
 					b.mutex.Lock()
-					b.gridLevels = append(b.gridLevels, *newLevel)
+					b.gridLevels = append(b.gridLevels, *newGrid)
 					b.mutex.Unlock()
 				}
 			}(order)
@@ -522,170 +549,187 @@ func (b *GridTradingBot) resetGridAroundPrice(pivotGridID int, pivotSide string)
 	}
 }
 
-// --- WebSocket 和主循环 ---
-
-// connectWebSocket 建立到币安用户数据流的 WebSocket 连接
+// connectWebSocket 连接到币安的用户数据流
 func (b *GridTradingBot) connectWebSocket() error {
-	var err error
-	b.listenKey, err = b.exchange.CreateListenKey()
+	// 1. 获取 Listen Key
+	listenKey, err := b.exchange.CreateListenKey()
 	if err != nil {
-		return fmt.Errorf("无法创建 listenKey: %v", err)
+		return fmt.Errorf("获取 listen key 失败: %v", err)
 	}
-	logger.S().Infof("成功获取 ListenKey: %s", b.listenKey)
+	b.listenKey = listenKey
+	logger.S().Info("成功获取 Listen Key。")
 
-	b.wsConn, err = b.exchange.ConnectWebSocket(b.listenKey)
+	// 2. 连接 WebSocket
+	conn, err := b.exchange.ConnectWebSocket(b.listenKey)
 	if err != nil {
-		return fmt.Errorf("无法连接到 WebSocket: %v", err)
+		return fmt.Errorf("连接 WebSocket 失败: %v", err)
 	}
-	logger.S().Info("成功连接到币安用户数据流 WebSocket。")
+	b.wsConn = conn
+	logger.S().Info("成功连接到用户数据流 WebSocket。")
+
+	// 3. 启动 Listen Key 的 Keep-Alive
+	go func() {
+		ticker := time.NewTicker(30 * time.Minute) // 币安建议每30分钟发送一次
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				err := b.exchange.KeepAliveListenKey(b.listenKey)
+				if err != nil {
+					logger.S().Warnf("保持 Listen Key 活跃失败: %v", err)
+				} else {
+					logger.S().Info("成功发送 Listen Key Keep-Alive 请求。")
+				}
+			case <-b.stopChannel:
+				return
+			}
+		}
+	}()
+
 	return nil
 }
 
-// webSocketLoop 维持 WebSocket 连接并处理消息
+// webSocketLoop 是处理WebSocket消息的主循环
 func (b *GridTradingBot) webSocketLoop() {
-	// listenKey 保活定时器 (币安应用层要求)
-	keepAliveTicker := time.NewTicker(30 * time.Minute)
-	defer keepAliveTicker.Stop()
+	if b.wsConn == nil {
+		logger.S().Error("WebSocket 连接为空，无法启动消息循环。")
+		return
+	}
+	defer b.wsConn.Close()
 
-	// WebSocket Ping 帧心跳定时器 (TCP物理连接层保活)
-	pingTicker := time.NewTicker(15 * time.Second)
-	defer pingTicker.Stop()
-
-	// messageOrErrChan 用于从读取goroutine接收消息或错误
+	// 定义一个带结果的结构体，用于从goroutine中接收消息和错误
 	type readResult struct {
 		message []byte
 		err     error
 	}
-	var messageOrErrChan chan readResult
-	var stopReadLoop chan struct{}
+	readChannel := make(chan readResult)
 
-	// startReadLoop 是一个辅助函数，用于启动消息读取goroutine
+	// 启动一个goroutine来读取消息，这样我们可以非阻塞地检查停止信号
 	startReadLoop := func() {
-		messageOrErrChan = make(chan readResult, 1)
-		stopReadLoop = make(chan struct{})
 		go func() {
 			for {
+				_, message, err := b.wsConn.ReadMessage()
 				select {
-				case <-stopReadLoop:
-					return
-				default:
-					if b.wsConn == nil {
-						messageOrErrChan <- readResult{err: fmt.Errorf("wsConn is nil, triggering reconnect")}
-						return // 退出 goroutine, 让主循环处理
-					}
-					_, msg, err := b.wsConn.ReadMessage()
-					messageOrErrChan <- readResult{message: msg, err: err}
+				case readChannel <- readResult{message, err}:
 					if err != nil {
-						return // 发生读取错误后退出 goroutine
+						return // 如果有错误，发送后退出goroutine
 					}
+				case <-b.stopChannel:
+					return // 如果机器人停止，也退出goroutine
 				}
 			}
 		}()
 	}
 
-	// 初始启动读取循环
-	startReadLoop()
+	startReadLoop() // 初始启动
+
+	logger.S().Info("WebSocket 消息监听循环已启动。")
 
 	for {
 		select {
-		case <-b.stopChannel:
-			logger.S().Info("WebSocket 循环已停止。")
-			if stopReadLoop != nil {
-				close(stopReadLoop)
-			}
-			return
-
-		case <-keepAliveTicker.C:
-			if b.listenKey != "" {
-				logger.S().Info("正在尝试延长 listenKey 的有效期...")
-				if err := b.exchange.KeepAliveListenKey(b.listenKey); err != nil {
-					logger.S().Errorf("延长 listenKey 失败: %v", err)
-				} else {
-					logger.S().Info("成功延长 listenKey 有效期。")
-				}
-			}
-
-		case <-pingTicker.C:
-			if b.wsConn != nil {
-				// 为 Ping 消息设置写入超时，防止永久阻塞
-				if err := b.wsConn.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
-					logger.S().Warnf("为 Ping 消息设置写入超时失败: %v", err)
-				}
-				if err := b.wsConn.WriteMessage(websocket.PingMessage, nil); err != nil {
-					// 如果发送ping失败，连接很可能已经断开。
-					// 此处只记录日志，读取循环的错误会触发真正的重连逻辑。
-					logger.S().Warnf("发送 WebSocket Ping 失败，连接可能已断开: %v", err)
-				}
-				// 重置写入超时
-				if err := b.wsConn.SetWriteDeadline(time.Time{}); err != nil {
-					logger.S().Warnf("重置 Ping 消息写入超时失败: %v", err)
-				}
-			}
-
-		case result := <-messageOrErrChan:
+		case result := <-readChannel:
 			if result.err != nil {
-				logger.S().Errorf("WebSocket 读取错误，正在尝试重连: %v", result.err)
-				if b.wsConn != nil {
-					b.wsConn.Close()
+				// 检查是否是正常的关闭错误
+				if websocket.IsCloseError(result.err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+					logger.S().Info("WebSocket 连接正常关闭。")
+				} else {
+					logger.S().Errorf("读取 WebSocket 消息失败: %v。尝试在5秒后重连...", result.err)
+					time.Sleep(5 * time.Second)
+					// 尝试重连
+					if err := b.connectWebSocket(); err != nil {
+						logger.S().Errorf("WebSocket 重连失败: %v", err)
+					} else {
+						startReadLoop() // 重连成功后，重新启动读取循环
+					}
 				}
-				if stopReadLoop != nil {
-					close(stopReadLoop)
-				}
-
-				// 执行重连
-				time.Sleep(5 * time.Second) // 等待5秒再重连
-				if err := b.connectWebSocket(); err != nil {
-					logger.S().Errorf("WebSocket 重连失败: %v。将再次尝试...", err)
-				}
-				// 为新的连接或下一次尝试重启读取循环
-				startReadLoop()
 				continue
 			}
+			// 处理收到的消息
+			b.handleWebSocketMessage(result.message)
 
-			if result.message != nil {
-				b.handleWebSocketMessage(result.message)
+		case <-b.stopChannel:
+			logger.S().Info("收到停止信号，正在关闭 WebSocket 消息循环。")
+			// 优雅地关闭连接
+			err := b.wsConn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+			if err != nil {
+				logger.S().Warnf("发送 WebSocket 关闭帧失败: %v", err)
 			}
+			return
 		}
 	}
 }
 
-// handleWebSocketMessage 解析并处理来自 WebSocket 的消息
+// handleWebSocketMessage 解析并处理来自WebSocket的消息
 func (b *GridTradingBot) handleWebSocketMessage(message []byte) {
-	var event models.UserDataEvent
-	if err := json.Unmarshal(message, &event); err != nil {
-		logger.S().Warnf("无法解析 WebSocket 消息: %s", string(message))
+	// 首先，尝试解析为通用的事件类型，以获取事件类型 "e"
+	var genericEvent struct {
+		EventType interface{} `json:"e"`
+	}
+	if err := json.Unmarshal(message, &genericEvent); err != nil {
+		// 这个错误理论上不应该再发生，除非JSON本身格式错误
+		logger.S().Warnf("无法初步解析WebSocket消息: %v, 原始消息: %s", err, string(message))
 		return
 	}
 
-	if event.EventType == "executionReport" {
-		report := event.ExecutionReport
-		logger.S().Infof("[WebSocket] 收到订单更新: Symbol=%s, Side=%s, Status=%s, OrderID=%d",
-			report.Symbol, report.Side, report.OrderStatus, report.OrderID)
+	// 使用类型断言来安全地处理事件类型
+	eventTypeString, ok := genericEvent.EventType.(string)
+	if !ok {
+		// 如果事件类型不是字符串，我们就记录下来，以便分析是什么我们没预料到的事件
+		logger.S().Infof("收到非字符串类型的事件, 类型: %T, 值: %v, 原始消息: %s", genericEvent.EventType, genericEvent.EventType, string(message))
+		return
+	}
 
-		if report.OrderStatus == "FILLED" {
-			// 查找被触发的网格
-			b.mutex.Lock()
-			var triggeredGrid *models.GridLevel
-			var triggeredIndex int
-			for i, level := range b.gridLevels {
-				if level.OrderID == report.OrderID {
-					triggeredGrid = &level
-					triggeredIndex = i
-					break
+	// 只处理我们关心的 'ORDER_TRADE_UPDATE' 事件
+	if eventTypeString == "ORDER_TRADE_UPDATE" {
+		var event models.OrderUpdateEvent
+		if err := json.Unmarshal(message, &event); err != nil {
+			// 即使 e 是字符串，整个消息的结构也可能不匹配 OrderUpdateEvent
+			logger.S().Warnf("无法完全解析 'ORDER_TRADE_UPDATE' 事件: %v, 原始消息: %s", err, string(message))
+			return
+		}
+
+		// 我们只关心订单完全成交(FILLED)的事件
+		if event.Order.ExecutionType == "TRADE" && event.Order.Status == "FILLED" {
+			logger.S().Infof("--- WebSocket 收到订单成交事件 ---")
+			logger.S().Infof("订单ID: %d, 交易对: %s, 方向: %s, 价格: %s, 数量: %s",
+				event.Order.OrderID, event.Order.Symbol, event.Order.Side, event.Order.Price, event.Order.OrigQty)
+
+			// 在一个单独的goroutine中处理，以避免阻塞WebSocket循环
+			go func(o models.OrderUpdateInfo) {
+				b.mutex.Lock()
+				defer b.mutex.Unlock()
+
+				var triggeredGrid *models.GridLevel
+				var triggeredIndex int = -1
+
+				// 找到被触发的网格
+				for i, grid := range b.gridLevels {
+					if grid.OrderID == o.OrderID {
+						triggeredGrid = &b.gridLevels[i]
+						triggeredIndex = i
+						break
+					}
 				}
-			}
 
-			if triggeredGrid != nil {
-				logger.S().Infof("网格订单 %d (GridID: %d, Side: %s, Price: %.4f) 已成交!",
-					triggeredGrid.OrderID, triggeredGrid.GridID, triggeredGrid.Side, triggeredGrid.Price)
+				if triggeredGrid != nil {
+					logger.S().Infof("匹配到活动的网格订单: GridID %d, 价格 %.4f", triggeredGrid.GridID, triggeredGrid.Price)
+					// 从活动列表中移除已成交的订单
+					b.gridLevels = append(b.gridLevels[:triggeredIndex], b.gridLevels[triggeredIndex+1:]...)
 
-				// 从活动列表中移除已成交的订单
-				b.gridLevels = append(b.gridLevels[:triggeredIndex], b.gridLevels[triggeredIndex+1:]...)
-
-				// 在新的 goroutine 中重置网格，以避免阻塞 WebSocket 循环
-				go b.resetGridAroundPrice(triggeredGrid.GridID, triggeredGrid.Side)
-			}
-			b.mutex.Unlock()
+					// 检查价格是否触及回归价
+					filledPrice, _ := strconv.ParseFloat(o.Price, 64)
+					if filledPrice >= b.reversionPrice {
+						logger.S().Infof("价格 %.4f 已达到或超过回归价 %.4f，准备重启周期。", filledPrice, b.reversionPrice)
+						// 发送信号以安全地重启周期
+						b.reentrySignal <- true
+					} else {
+						// 在新的goroutine中重置网格，以避免死锁
+						go b.resetGridAroundPrice(triggeredGrid.GridID, triggeredGrid.Side)
+					}
+				} else {
+					logger.S().Warnf("收到已成交订单 %d 的更新，但在活动网格中未找到匹配项。可能是在重置过程中成交的。", o.OrderID)
+				}
+			}(event.Order)
 		}
 	}
 }
@@ -700,59 +744,74 @@ func (b *GridTradingBot) Start() error {
 	b.isRunning = true
 	b.mutex.Unlock()
 
-	logger.S().Info("--- 机器人启动 ---")
+	logger.S().Info("--- 机器人正在启动 ---")
 
-	// 如果不是回测模式，则连接 WebSocket
+	// 在实盘模式下，连接WebSocket
 	if !b.IsBacktest {
 		if err := b.connectWebSocket(); err != nil {
-			return fmt.Errorf("启动失败，无法连接 WebSocket: %v", err)
+			return fmt.Errorf("启动时连接WebSocket失败: %v", err)
 		}
-		go b.webSocketLoop()
+		go b.webSocketLoop() // 启动WebSocket消息处理循环
 	}
 
-	// 检查是否需要建立初始仓位
-	b.mutex.RLock()
-	isEstablished := b.basePositionEstablished
-	b.mutex.RUnlock()
-
-	if !isEstablished {
+	// 尝试加载状态，如果失败则初始化
+	if err := b.LoadState("grid_state.json"); err != nil {
+		logger.S().Warnf("加载状态失败: %v. 将执行市场入场和网格设置。", err)
 		if err := b.enterMarketAndSetupGrid(); err != nil {
-			return fmt.Errorf("初始化网格和仓位失败: %v", err)
+			return fmt.Errorf("机器人初始化失败: %v", err)
 		}
+	} else {
+		logger.S().Info("成功从文件加载状态，机器人已恢复。")
+		// 即使加载成功，也要确保底仓标记是正确的
+		b.mutex.Lock()
+		b.basePositionEstablished = true
+		b.mutex.Unlock()
 	}
 
-	// 启动主策略循环（如果需要的话）
-	// go b.strategyLoop() // 当前版本，主要逻辑由 WebSocket 事件驱动
+	go b.strategyLoop()  // 启动主要的策略循环（用于处理再入场等）
+	go b.monitorStatus() // 启动状态监控
 
-	// 启动状态监控
-	go b.monitorStatus()
-
+	logger.S().Info("--- 机器人已成功启动 ---")
 	return nil
 }
 
-// strategyLoop 是机器人的主循环（在当前事件驱动模型中可能被简化）
+// strategyLoop 是一个独立的循环，用于处理需要解耦的策略逻辑，如再入场
 func (b *GridTradingBot) strategyLoop() {
-	logger.S().Info("策略循环已启动。")
-	ticker := time.NewTicker(10 * time.Second) // 例如，每10秒检查一次状态
-	defer ticker.Stop()
-
+	logger.S().Info("策略循环已启动，等待信号...")
 	for {
 		select {
-		case <-ticker.C:
-			b.mutex.RLock()
-			// 在这里可以添加一些周期性的检查逻辑，
-			// 例如检查与交易所的连接状态，或打印状态摘要。
-			// logger.S().Debug("策略循环心跳...")
-			b.mutex.RUnlock()
+		case <-b.reentrySignal:
+			b.mutex.Lock()
+			if b.isReentering {
+				b.mutex.Unlock()
+				logger.S().Info("已在再入场流程中，忽略新的信号。")
+				continue
+			}
+			b.isReentering = true
+			b.mutex.Unlock()
+
+			logger.S().Info("收到再入场信号，开始执行...")
+			// 取消所有订单
+			if err := b.exchange.CancelAllOpenOrders(b.config.Symbol); err != nil {
+				logger.S().Errorf("再入场时取消所有订单失败: %v", err)
+			}
+			// 重新进入市场
+			if err := b.enterMarketAndSetupGrid(); err != nil {
+				logger.S().Errorf("再入场时执行 enterMarketAndSetupGrid 失败: %v", err)
+			}
+			b.mutex.Lock()
+			b.isReentering = false
+			b.mutex.Unlock()
+			logger.S().Info("再入场流程完成。")
 
 		case <-b.stopChannel:
-			logger.S().Info("策略循环已停止。")
+			logger.S().Info("收到停止信号，正在关闭策略循环。")
 			return
 		}
 	}
 }
 
-// StartForBacktest 为回测模式启动机器人
+// StartForBacktest 为回测模式准备机器人，但不启动循环
 func (b *GridTradingBot) StartForBacktest() error {
 	b.mutex.Lock()
 	if b.isRunning {
@@ -762,48 +821,56 @@ func (b *GridTradingBot) StartForBacktest() error {
 	b.isRunning = true
 	b.mutex.Unlock()
 
-	logger.S().Info("--- 回测机器人启动 ---")
-
-	// 在回测中，我们不连接 WebSocket，而是直接设置网格
+	// 在回测中，我们不加载状态，总是从新开始
 	if err := b.enterMarketAndSetupGrid(); err != nil {
-		return fmt.Errorf("回测初始化网格失败: %v", err)
+		return fmt.Errorf("回测机器人初始化失败: %v", err)
 	}
 
+	logger.S().Info("--- 回测机器人已初始化 ---")
 	return nil
 }
 
-// ProcessBacktestTick 处理回测中的每个时间点
+// ProcessBacktestTick 在回测模式下处理单个时间点的数据
 func (b *GridTradingBot) ProcessBacktestTick() {
 	b.mutex.Lock()
 	defer b.mutex.Unlock()
 
-	if !b.isRunning {
+	if !b.isRunning || b.isHalted {
 		return
 	}
 
-	// 在回测模式下，订单成交逻辑已在 exchange.SetPrice 中同步处理。
-	// 此函数现在主要负责处理每个时间点（tick）的其他逻辑，例如检查止损。
+	// 模拟交易所检查订单成交
+	var filledGrids []models.GridLevel
+	var remainingGrids []models.GridLevel
 
-	// 检查止损
-	if b.config.StopLossRate > 0 {
-		positions, err := b.exchange.GetPositions(b.config.Symbol)
-		if err != nil {
-			logger.S().Errorf("回测检查止损时获取持仓失败: %v", err)
-			return
+	for _, grid := range b.gridLevels {
+		if (grid.Side == "BUY" && b.currentPrice <= grid.Price) || (grid.Side == "SELL" && b.currentPrice >= grid.Price) {
+			filledGrids = append(filledGrids, grid)
+			logger.S().Infof("[回测] 订单成交: %s @ %.4f, GridID: %d", grid.Side, grid.Price, grid.GridID)
+		} else {
+			remainingGrids = append(remainingGrids, grid)
 		}
-		if len(positions) > 0 {
-			entryPrice, _ := strconv.ParseFloat(positions[0].EntryPrice, 64)
-			positionAmt, _ := strconv.ParseFloat(positions[0].PositionAmt, 64)
-			stopLossPrice := entryPrice * (1 - b.config.StopLossRate)
-			if positionAmt > 0 && b.currentPrice <= stopLossPrice {
-				logger.S().Infof("触发止损：当前价格 %.4f <= 止损价格 %.4f", b.currentPrice, stopLossPrice)
-				b.Stop()
-			}
+	}
+
+	b.gridLevels = remainingGrids
+
+	// 检查是否触及回归价
+	if b.currentPrice >= b.reversionPrice {
+		logger.S().Infof("[回测] 价格 %.4f 已达到或超过回归价 %.4f，准备重启周期。", b.currentPrice, b.reversionPrice)
+		// 在回测中直接调用，因为是单线程
+		if err := b.enterMarketAndSetupGrid(); err != nil {
+			logger.S().Errorf("[回测] 再入场失败: %v", err)
+		}
+	} else {
+		// 如果有订单成交，则重置网格
+		for _, filledGrid := range filledGrids {
+			// 在回测中，我们直接调用 resetGrid，因为它会同步执行
+			b.resetGridAroundPrice(filledGrid.GridID, filledGrid.Side)
 		}
 	}
 }
 
-// SetCurrentPrice 设置当前价格（主要用于回测）
+// SetCurrentPrice 设置当前价格，主要用于回测
 func (b *GridTradingBot) SetCurrentPrice(price float64) {
 	b.mutex.Lock()
 	defer b.mutex.Unlock()
@@ -815,41 +882,45 @@ func (b *GridTradingBot) Stop() {
 	b.mutex.Lock()
 	if !b.isRunning {
 		b.mutex.Unlock()
+		logger.S().Info("机器人已经停止。")
 		return
 	}
 	b.isRunning = false
+	close(b.stopChannel) // 关闭通道以广播停止信号
 	b.mutex.Unlock()
 
-	logger.S().Info("--- 正在停止机器人 ---")
-	close(b.stopChannel)
+	logger.S().Info("--- 机器人正在停止 ---")
 
-	// 关闭 WebSocket 连接
-	if b.wsConn != nil {
-		err := b.wsConn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
-		if err != nil {
-			logger.S().Warnf("发送 WebSocket 关闭帧失败: %v", err)
-		}
-		b.wsConn.Close()
-		logger.S().Info("WebSocket 连接已关闭。")
+	// 在实盘模式下，取消所有挂单
+	if !b.IsBacktest {
+		logger.S().Info("正在取消所有未结订单...")
+		b.cancelAllActiveOrders()
 	}
 
-	// 在停止时取消所有挂单
-	b.cancelAllActiveOrders()
-	logger.S().Info("所有活动订单已取消。")
+	// 等待一小段时间确保所有goroutine都已收到信号
+	time.Sleep(1 * time.Second)
+
+	logger.S().Info("--- 机器人已停止 ---")
 }
 
 // cancelAllActiveOrders 取消所有活动的网格订单
 func (b *GridTradingBot) cancelAllActiveOrders() {
 	b.mutex.RLock()
 	defer b.mutex.RUnlock()
-	logger.S().Infof("正在取消 %d 个活动订单...", len(b.gridLevels))
+
+	logger.S().Infof("准备取消 %d 个活动订单...", len(b.gridLevels))
 	if err := b.exchange.CancelAllOpenOrders(b.config.Symbol); err != nil {
-		logger.S().Errorf("取消所有订单失败: %v", err)
+		logger.S().Errorf("停止机器人时取消所有订单失败: %v", err)
+	} else {
+		logger.S().Info("已成功发送取消所有订单的请求。")
 	}
 }
 
 // monitorStatus 定期打印机器人状态
 func (b *GridTradingBot) monitorStatus() {
+	if b.IsBacktest {
+		return // 回测模式下不打印状态
+	}
 	ticker := time.NewTicker(30 * time.Second) // 每30秒打印一次
 	defer ticker.Stop()
 
@@ -864,20 +935,16 @@ func (b *GridTradingBot) monitorStatus() {
 	}
 }
 
-// SaveState 保存机器人状态到文件
+// SaveState 将机器人的当前状态保存到文件
 func (b *GridTradingBot) SaveState(path string) error {
 	b.mutex.RLock()
 	defer b.mutex.RUnlock()
 
-	state := models.BotState{
-		GridLevels:              b.gridLevels,
-		BasePositionEstablished: b.basePositionEstablished,
-		ConceptualGrid:          b.conceptualGrid,
-		EntryPrice:              b.entryPrice,
-		ReversionPrice:          b.reversionPrice,
-		IsReentering:            b.isReentering,
-		CurrentPrice:            b.currentPrice,
-		CurrentTime:             b.exchange.GetCurrentTime(),
+	state := &models.GridState{
+		GridLevels:     b.gridLevels,
+		EntryPrice:     b.entryPrice,
+		ReversionPrice: b.reversionPrice,
+		ConceptualGrid: b.conceptualGrid,
 	}
 
 	data, err := json.MarshalIndent(state, "", "  ")
@@ -885,20 +952,26 @@ func (b *GridTradingBot) SaveState(path string) error {
 		return fmt.Errorf("序列化状态失败: %v", err)
 	}
 
-	return ioutil.WriteFile(path, data, 0644)
+	if err := ioutil.WriteFile(path, data, 0644); err != nil {
+		return fmt.Errorf("写入状态文件失败: %v", err)
+	}
+
+	logger.S().Infof("机器人状态已成功保存到 %s", path)
+	return nil
 }
 
-// LoadState 从文件加载机器人状态
+// LoadState 从文件加载机器人的状态
 func (b *GridTradingBot) LoadState(path string) error {
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return fmt.Errorf("状态文件 %s 不存在", path)
+	}
+
 	data, err := ioutil.ReadFile(path)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return fmt.Errorf("状态文件不存在: %s", path)
-		}
 		return fmt.Errorf("读取状态文件失败: %v", err)
 	}
 
-	var state models.BotState
+	var state models.GridState
 	if err := json.Unmarshal(data, &state); err != nil {
 		return fmt.Errorf("反序列化状态失败: %v", err)
 	}
@@ -907,15 +980,11 @@ func (b *GridTradingBot) LoadState(path string) error {
 	defer b.mutex.Unlock()
 
 	b.gridLevels = state.GridLevels
-	b.basePositionEstablished = state.BasePositionEstablished
-	b.conceptualGrid = state.ConceptualGrid
 	b.entryPrice = state.EntryPrice
 	b.reversionPrice = state.ReversionPrice
-	b.isReentering = state.IsReentering
-	b.currentPrice = state.CurrentPrice
-	b.currentTime = state.CurrentTime
+	b.conceptualGrid = state.ConceptualGrid
 
-	logger.S().Infof("成功从 %s 加载机器人状态。", path)
+	logger.S().Infof("机器人状态已成功从 %s 加载", path)
 	return nil
 }
 
@@ -924,30 +993,32 @@ func (b *GridTradingBot) printStatus() {
 	b.mutex.RLock()
 	defer b.mutex.RUnlock()
 
-	if !b.isRunning {
-		logger.S().Info("[状态] 机器人已停止。")
-		return
+	logger.S().Info("--- 机器人状态报告 ---")
+	logger.S().Infof("交易对: %s", b.config.Symbol)
+	logger.S().Infof("当前价格: %.4f", b.currentPrice)
+	logger.S().Infof("运行状态: %v", b.isRunning)
+	logger.S().Infof("本周期入场价: %.4f", b.entryPrice)
+	logger.S().Infof("本周期回归价: %.4f", b.reversionPrice)
+	logger.S().Infof("活动挂单数: %d", len(b.gridLevels))
+
+	// 打印活动订单详情
+	for _, level := range b.gridLevels {
+		logger.S().Infof("  - %s 单: 价格 %.4f, 数量 %.5f, GridID: %d, OrderID: %d",
+			level.Side, level.Price, level.Quantity, level.GridID, level.OrderID)
 	}
 
-	positionValue, accountEquity, err := b.exchange.GetAccountState(b.config.Symbol)
+	// 打印持仓信息
+	positions, err := b.exchange.GetPositions(b.config.Symbol)
 	if err != nil {
-		logger.S().Warnf("无法获取账户状态: %v", err)
-		return
+		logger.S().Warnf("无法获取持仓信息: %v", err)
+	} else if len(positions) > 0 {
+		pos := positions[0]
+		logger.S().Infof("当前持仓: 数量: %s, 入场价: %s, 未实现盈亏: %s",
+			pos.PositionAmt, pos.EntryPrice, pos.UnrealizedProfit)
+	} else {
+		logger.S().Info("当前无持仓。")
 	}
-
-	walletExposure := 0.0
-	if accountEquity > 0 {
-		walletExposure = (positionValue / accountEquity) * 100
-	}
-
-	logger.S().Infof(
-		"[状态摘要] 运行中: %v | 活动订单: %d | 当前价格: %.4f | 钱包暴露: %.2f%% | 账户权益: %.4f",
-		b.isRunning,
-		len(b.gridLevels),
-		b.currentPrice,
-		walletExposure,
-		accountEquity,
-	)
+	logger.S().Info("----------------------")
 }
 
 // adjustValueToStep 使用更健壮的方法来调整数值以符合交易所的精度要求（步长）。
@@ -987,11 +1058,8 @@ func adjustValueToStep(value float64, step string) float64 {
 }
 
 // generateClientOrderID 生成一个唯一的客户端订单ID
-func (b *GridTradingBot) generateClientOrderID(prefix string) string {
-	// 币安要求 clientOrderId 长度在 1 到 36 之间，并且只能包含字母、数字和'-' '_'
-	// 我们使用 "prefix-timestamp" 的格式
-	timestamp := time.Now().UnixNano() / int64(time.Millisecond)
-	return fmt.Sprintf("%s-%d", prefix, timestamp)
+func (b *GridTradingBot) generateClientOrderID() (string, error) {
+	return b.idGenerator.Generate()
 }
 
 // isWithinExposureLimit 检查增加一笔交易后是否会超过钱包风险暴露上限
@@ -1034,13 +1102,72 @@ func (b *GridTradingBot) isWithinExposureLimit(quantityToAdd float64) bool {
 		)
 		return false
 	}
-
 	return true
 }
 
-// IsHalted 返回机器人是否处于暂停状态
+// IsHalted 返回机器人是否已暂停
 func (b *GridTradingBot) IsHalted() bool {
 	b.mutex.RLock()
 	defer b.mutex.RUnlock()
 	return b.isHalted
+}
+
+// syncWithExchange 是一个新的函数，用于在从状态文件恢复后，将本地概念与交易所的实际情况同步
+func (b *GridTradingBot) syncWithExchange() error {
+	logger.S().Info("开始与交易所同步状态...")
+
+	// 1. 获取所有远程的开放订单
+	remoteOrders, err := b.exchange.GetOpenOrders(b.config.Symbol)
+	if err != nil {
+		return fmt.Errorf("无法从交易所获取开放订单: %v", err)
+	}
+	logger.S().Infof("从交易所获取了 %d 个开放订单。", len(remoteOrders))
+
+	// 2. 清空本地的活动订单列表，准备重建
+	b.mutex.Lock()
+	b.gridLevels = make([]models.GridLevel, 0)
+	b.mutex.Unlock()
+
+	// 3. 遍历远程订单，尝试将其与本地的“天地网格”匹配
+	for _, remoteOrder := range remoteOrders {
+		price, _ := strconv.ParseFloat(remoteOrder.Price, 64)
+		quantity, _ := strconv.ParseFloat(remoteOrder.OrigQty, 64)
+
+		// 寻找这个价格是否在我们理论网格的价位上
+		matchedGridID := -1
+		for id, conceptualPrice := range b.conceptualGrid {
+			// 使用一个小的容差来比较浮点数
+			if math.Abs(price-conceptualPrice) < 1e-8 {
+				matchedGridID = id
+				break
+			}
+		}
+
+		if matchedGridID != -1 {
+			// 这是一个我们认识的订单，将其添加到本地活动订单列表
+			newGridLevel := models.GridLevel{
+				Price:    price,
+				Quantity: quantity,
+				Side:     remoteOrder.Side,
+				IsActive: true,
+				OrderID:  remoteOrder.OrderId,
+				GridID:   matchedGridID,
+			}
+			b.mutex.Lock()
+			b.gridLevels = append(b.gridLevels, newGridLevel)
+			b.mutex.Unlock()
+			logger.S().Infof("成功匹配并恢复订单: ID %d, GridID %d, Side %s, Price %.4f",
+				remoteOrder.OrderId, matchedGridID, remoteOrder.Side, price)
+		} else {
+			// 这是一个我们不认识的订单，可能是手动下的，或者属于上一个周期的残留订单。取消它。
+			logger.S().Warnf("发现一个无法匹配到当前天地网格的订单: ID %d, Price %.4f. 将其取消...",
+				remoteOrder.OrderId, price)
+			if err := b.exchange.CancelOrder(b.config.Symbol, remoteOrder.OrderId); err != nil {
+				logger.S().Errorf("取消无法识别的订单 %d 失败: %v", remoteOrder.OrderId, err)
+			}
+		}
+	}
+
+	logger.S().Info("与交易所状态同步完成。")
+	return nil
 }

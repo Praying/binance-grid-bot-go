@@ -450,7 +450,7 @@ func (e *BacktestExchange) GetPositions(symbol string) ([]models.Position, error
 				Symbol:           symbol,
 				PositionAmt:      fmt.Sprintf("%f", posSize),
 				EntryPrice:       fmt.Sprintf("%f", avgPrice),
-				UnRealizedProfit: fmt.Sprintf("%f", e.UnrealizedPNL),
+				UnrealizedProfit: fmt.Sprintf("%f", e.UnrealizedPNL),
 				LiquidationPrice: fmt.Sprintf("%f", e.LiquidationPrice),
 				Leverage:         strconv.Itoa(e.Leverage),
 				MarginType:       strings.ToLower(e.config.MarginType),

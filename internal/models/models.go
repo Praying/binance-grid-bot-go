@@ -75,7 +75,7 @@ type Position struct {
 	PositionAmt      string `json:"positionAmt"`
 	EntryPrice       string `json:"entryPrice"`
 	MarkPrice        string `json:"markPrice"`
-	UnRealizedProfit string `json:"unRealizedProfit"`
+	UnrealizedProfit string `json:"unRealizedProfit"`
 	LiquidationPrice string `json:"liquidationPrice"`
 	Leverage         string `json:"leverage"`
 	MaxNotionalValue string `json:"maxNotionalValue"`
@@ -263,4 +263,54 @@ type Error struct {
 // Error 方法使得 BinanceError 实现了 error 接口
 func (e *Error) Error() string {
 	return fmt.Sprintf("API Error: code=%d, msg=%s", e.Code, e.Msg)
+}
+
+// GridState 定义了需要持久化保存的机器人状态
+type GridState struct {
+	GridLevels     []GridLevel `json:"grid_levels"`
+	EntryPrice     float64     `json:"entry_price"`
+	ReversionPrice float64     `json:"reversion_price"`
+	ConceptualGrid []float64   `json:"conceptual_grid"`
+}
+
+// OrderUpdateEvent 是从用户数据流接收到的订单更新事件的完整结构
+type OrderUpdateEvent struct {
+	EventType       string          `json:"e"` // Event type, e.g., "ORDER_TRADE_UPDATE"
+	EventTime       int64           `json:"E"` // Event time
+	TransactionTime int64           `json:"T"` // Transaction time
+	Order           OrderUpdateInfo `json:"o"` // Order information
+}
+
+// OrderUpdateInfo 包含了订单更新的具体信息
+type OrderUpdateInfo struct {
+	Symbol          string `json:"s"`  // Symbol
+	ClientOrderID   string `json:"c"`  // Client Order ID
+	Side            string `json:"S"`  // Side
+	OrderType       string `json:"o"`  // Order Type
+	TimeInForce     string `json:"f"`  // Time in Force
+	OrigQty         string `json:"q"`  // Original Quantity
+	Price           string `json:"p"`  // Price
+	AvgPrice        string `json:"ap"` // Average Price
+	StopPrice       string `json:"sp"` // Stop Price
+	ExecutionType   string `json:"x"`  // Execution Type
+	Status          string `json:"X"`  // Order Status
+	OrderID         int64  `json:"i"`  // Order ID
+	ExecutedQty     string `json:"l"`  // Last Executed Quantity
+	CumQty          string `json:"z"`  // Cumulative Filled Quantity
+	ExecutedPrice   string `json:"L"`  // Last Executed Price
+	CommissionAmt   string `json:"n"`  // Commission Amount
+	CommissionAsset string `json:"N"`  // Commission Asset, will be null if not traded
+	TradeTime       int64  `json:"T"`  // Trade Time
+	TradeID         int64  `json:"t"`  // Trade ID
+	BidsNotional    string `json:"b"`  // Bids Notional
+	AsksNotional    string `json:"a"`  // Asks Notional
+	IsMaker         bool   `json:"m"`  // Is the trade a maker trade?
+	IsReduceOnly    bool   `json:"R"`  // Is this a reduce only order?
+	WorkingType     string `json:"wt"` // Stop Price Working Type
+	OrigType        string `json:"ot"` // Original Order Type
+	PositionSide    string `json:"ps"` // Position Side
+	ClosePosition   bool   `json:"cp"` // If conditional order, is it close position?
+	ActivationPrice string `json:"AP"` // Activation Price, only available for TRAILING_STOP_MARKET order
+	CallbackRate    string `json:"cr"` // Callback Rate, only available for TRAILING_STOP_MARKET order
+	RealizedProfit  string `json:"rp"` // Realized Profit of the trade
 }
