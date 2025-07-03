@@ -3,3 +3,5 @@
 .roo
 .vscode/
 .bmad-core/
+web-bundles/
+.env
