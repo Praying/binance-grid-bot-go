@@ -543,48 +543,108 @@ func (b *GridTradingBot) connectWebSocket() error {
 
 // webSocketLoop 维持 WebSocket 连接并处理消息
 func (b *GridTradingBot) webSocketLoop() {
-	// 启动一个 goroutine 来定期延长 listenKey 的有效期
-	go func() {
-		ticker := time.NewTicker(30 * time.Minute) // 每30分钟续期一次
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
+	// listenKey 保活定时器 (币安应用层要求)
+	keepAliveTicker := time.NewTicker(30 * time.Minute)
+	defer keepAliveTicker.Stop()
+
+	// WebSocket Ping 帧心跳定时器 (TCP物理连接层保活)
+	pingTicker := time.NewTicker(15 * time.Second)
+	defer pingTicker.Stop()
+
+	// messageOrErrChan 用于从读取goroutine接收消息或错误
+	type readResult struct {
+		message []byte
+		err     error
+	}
+	var messageOrErrChan chan readResult
+	var stopReadLoop chan struct{}
+
+	// startReadLoop 是一个辅助函数，用于启动消息读取goroutine
+	startReadLoop := func() {
+		messageOrErrChan = make(chan readResult, 1)
+		stopReadLoop = make(chan struct{})
+		go func() {
+			for {
+				select {
+				case <-stopReadLoop:
+					return
+				default:
+					if b.wsConn == nil {
+						messageOrErrChan <- readResult{err: fmt.Errorf("wsConn is nil, triggering reconnect")}
+						return // 退出 goroutine, 让主循环处理
+					}
+					_, msg, err := b.wsConn.ReadMessage()
+					messageOrErrChan <- readResult{message: msg, err: err}
+					if err != nil {
+						return // 发生读取错误后退出 goroutine
+					}
+				}
+			}
+		}()
+	}
+
+	// 初始启动读取循环
+	startReadLoop()
+
+	for {
+		select {
+		case <-b.stopChannel:
+			logger.S().Info("WebSocket 循环已停止。")
+			if stopReadLoop != nil {
+				close(stopReadLoop)
+			}
+			return
+
+		case <-keepAliveTicker.C:
+			if b.listenKey != "" {
+				logger.S().Info("正在尝试延长 listenKey 的有效期...")
 				if err := b.exchange.KeepAliveListenKey(b.listenKey); err != nil {
 					logger.S().Errorf("延长 listenKey 失败: %v", err)
 				} else {
 					logger.S().Info("成功延长 listenKey 有效期。")
 				}
-			case <-b.stopChannel:
-				return
 			}
-		}
-	}()
 
-	// 主消息处理循环
-	for {
-		select {
-		case <-b.stopChannel:
-			logger.S().Info("WebSocket 循环已停止。")
-			return
-		default:
-			if b.wsConn == nil {
-				logger.S().Error("WebSocket 连接为空，无法读取消息。")
-				time.Sleep(5 * time.Second) // 等待重连
-				continue
-			}
-			_, message, err := b.wsConn.ReadMessage()
-			if err != nil {
-				logger.S().Errorf("读取 WebSocket 消息失败: %v。尝试重连...", err)
-				// 实现重连逻辑
-				b.wsConn.Close()
-				if err := b.connectWebSocket(); err != nil {
-					logger.S().Errorf("WebSocket 重连失败: %v", err)
-					time.Sleep(5 * time.Second)
+		case <-pingTicker.C:
+			if b.wsConn != nil {
+				// 为 Ping 消息设置写入超时，防止永久阻塞
+				if err := b.wsConn.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
+					logger.S().Warnf("为 Ping 消息设置写入超时失败: %v", err)
 				}
+				if err := b.wsConn.WriteMessage(websocket.PingMessage, nil); err != nil {
+					// 如果发送ping失败，连接很可能已经断开。
+					// 此处只记录日志，读取循环的错误会触发真正的重连逻辑。
+					logger.S().Warnf("发送 WebSocket Ping 失败，连接可能已断开: %v", err)
+				}
+				// 重置写入超时
+				if err := b.wsConn.SetWriteDeadline(time.Time{}); err != nil {
+					logger.S().Warnf("重置 Ping 消息写入超时失败: %v", err)
+				}
+			}
+
+		case result := <-messageOrErrChan:
+			if result.err != nil {
+				logger.S().Errorf("WebSocket 读取错误，正在尝试重连: %v", result.err)
+				if b.wsConn != nil {
+					b.wsConn.Close()
+				}
+				if stopReadLoop != nil {
+					close(stopReadLoop)
+				}
+
+				// 执行重连
+				time.Sleep(5 * time.Second) // 等待5秒再重连
+				if err := b.connectWebSocket(); err != nil {
+					logger.S().Errorf("WebSocket 重连失败: %v。将再次尝试...", err)
+				}
+				// 为新的连接或下一次尝试重启读取循环
+				startReadLoop()
 				continue
 			}
-			b.handleWebSocketMessage(message)
+
+			if result.message != nil {
+				b.handleWebSocketMessage(result.message)
+			}
 		}
 	}
 }

@@ -18,6 +18,7 @@ type Exchange interface {
 	SetPositionMode(isHedgeMode bool) error
 	GetPositionMode() (bool, error)
 	SetMarginType(symbol string, marginType string) error
+	GetMarginType(symbol string) (string, error)
 	GetAccountInfo() (*models.AccountInfo, error)
 	CancelAllOpenOrders(symbol string) error
 	GetOrderStatus(symbol string, orderID int64) (*models.Order, error)

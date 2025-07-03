@@ -160,7 +160,6 @@ func runLiveMode(cfg *models.Config) {
 
 	// 1. 设置持仓模式 (单向/双向)
 	// --- 隔离测试：调用另一个需要签名的GET接口来验证签名逻辑 ---
-	logger.S().Info("[调试] 正在调用 GetAccountInfo 来测试签名...")
 	if _, err := liveExchange.GetAccountInfo(); err != nil {
 		logger.S().Fatalf("[调试] 调用 GetAccountInfo 失败: %v", err)
 	}
@@ -184,10 +183,20 @@ func runLiveMode(cfg *models.Config) {
 	}
 
 	// 2. 设置保证金模式 (全仓/逐仓)
-	if err := liveExchange.SetMarginType(cfg.Symbol, cfg.MarginType); err != nil {
-		logger.S().Fatalf("设置保证金模式失败: %v", err)
+	currentMarginType, err := liveExchange.GetMarginType(cfg.Symbol)
+	if err != nil {
+		logger.S().Fatalf("获取当前保证金模式失败: %v", err)
+	}
+
+	// 比较时忽略大小写
+	if !strings.EqualFold(currentMarginType, cfg.MarginType) {
+		logger.S().Infof("当前保证金模式 (%s) 与配置 (%s) 不符，正在尝试更新...", currentMarginType, cfg.MarginType)
+		if err := liveExchange.SetMarginType(cfg.Symbol, cfg.MarginType); err != nil {
+			logger.S().Fatalf("设置保证金模式失败: %v", err)
+		}
+		logger.S().Infof("保证金模式成功更新为: %s", cfg.MarginType)
 	} else {
-		logger.S().Infof("保证金模式设置成功: %s", cfg.MarginType)
+		logger.S().Infof("当前保证金模式已是目标模式 (%s)，无需更改。", cfg.MarginType)
 	}
 
 	// 初始化机器人

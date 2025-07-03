@@ -295,6 +295,29 @@ func (e *LiveExchange) SetMarginType(symbol string, marginType string) error {
 	return nil // 没有错误，成功
 }
 
+// GetMarginType 获取指定交易对的保证金模式。
+func (e *LiveExchange) GetMarginType(symbol string) (string, error) {
+	params := url.Values{}
+	params.Set("symbol", symbol)
+	data, err := e.doRequest("GET", "/fapi/v2/positionRisk", params, true)
+	if err != nil {
+		return "", fmt.Errorf("获取持仓风险信息以确定保证金模式失败: %v", err)
+	}
+
+	var positions []models.Position
+	if err := json.Unmarshal(data, &positions); err != nil {
+		return "", fmt.Errorf("解析持仓风险响应失败: %v", err)
+	}
+
+	if len(positions) == 0 {
+		return "", fmt.Errorf("API未返回交易对 %s 的持仓风险信息", symbol)
+	}
+
+	// 保证金模式是针对交易对的，所以取第一个结果即可。
+	// API返回的是小写 (e.g., "cross", "isolated")，配置中是大写，因此需要转换。
+	return strings.ToUpper(positions[0].MarginType), nil
+}
+
 // GetAccountInfo 获取账户信息。
 func (e *LiveExchange) GetAccountInfo() (*models.AccountInfo, error) {
 	data, err := e.doRequest("GET", "/fapi/v2/account", nil, true)
