@@ -201,8 +201,6 @@ func runLiveMode(cfg *models.Config) {
 	// 初始化机器人
 	gridBot := bot.NewGridTradingBot(cfg, liveExchange, false)
 
-	// 状态加载逻辑已移至 bot.Start() 内部
-
 	// 启动机器人
 	if err := gridBot.Start(); err != nil {
 		logger.S().Fatalf("机器人启动失败: %v", err)

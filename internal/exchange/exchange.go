@@ -7,6 +7,16 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// NewOrderRequest 定义了创建一个新订单所需的所有参数。
+// 这是一个标准化的结构，用于在机器人和交易所实现之间传递信息。
+type NewOrderRequest struct {
+	Symbol   string
+	Side     string
+	Type     string
+	Price    float64
+	Quantity float64
+}
+
 // Exchange 定义了所有交易所实现必须提供的通用方法。
 // 这使得交易机器人可以在真实交易和回测之间轻松切换。
 type Exchange interface {

@@ -7,29 +7,31 @@ import (
 
 // Config 结构体定义了机器人的所有配置参数
 type Config struct {
-	IsTestnet           bool      `json:"is_testnet"` // 是否使用测试网
-	LiveAPIURL          string    `json:"live_api_url"`
-	LiveWSURL           string    `json:"live_ws_url"`
-	TestnetAPIURL       string    `json:"testnet_api_url"`
-	TestnetWSURL        string    `json:"testnet_ws_url"`
-	Symbol              string    `json:"symbol"`                   // 交易对，如 "BTCUSDT"
-	GridSpacing         float64   `json:"grid_spacing"`             // 网格间距比例
-	GridValue           float64   `json:"grid_value,omitempty"`     // 每个网格的交易价值 (USDT)
-	GridQuantity        float64   `json:"grid_quantity,omitempty"`  // 新增：每个网格的交易数量（基础货币）
-	MinNotionalValue    float64   `json:"min_notional_value"`       // 新增: 交易所最小订单名义价值 (例如 5 USDT)
-	InitialInvestment   float64   `json:"initial_investment"`       // 初始投资额 (USDT), 用于市价买入
-	Leverage            int       `json:"leverage"`                 // 杠杆倍数
-	MarginType          string    `json:"margin_type"`              // 保证金模式: CROSSED 或 ISOLATED
-	PositionMode        string    `json:"position_mode"`            // 新增: 持仓模式, "Oneway" 或 "Hedge"
-	StopLossRate        float64   `json:"stop_loss_rate,omitempty"` // 新增: 止损率
-	HedgeMode           bool      `json:"hedge_mode"`               // 是否开启对冲模式 (双向持仓)
-	GridCount           int       `json:"grid_count"`               // 网格数量（对）
-	ActiveOrdersCount   int       `json:"active_orders_count"`      // 在价格两侧各挂的订单数量
-	ReturnRate          float64   `json:"return_rate"`              // 预期回归价格比例
-	WalletExposureLimit float64   `json:"wallet_exposure_limit"`    // 新增：钱包风险暴露上限
-	LogConfig           LogConfig `json:"log"`                      // 新增：日志配置
-	RetryAttempts       int       `json:"retry_attempts"`           // 新增: 下单失败时的重试次数
-	RetryInitialDelayMs int       `json:"retry_initial_delay_ms"`   // 新增: 重试前的初始延迟毫秒数
+	IsTestnet                bool      `json:"is_testnet"` // 是否使用测试网
+	LiveAPIURL               string    `json:"live_api_url"`
+	LiveWSURL                string    `json:"live_ws_url"`
+	TestnetAPIURL            string    `json:"testnet_api_url"`
+	TestnetWSURL             string    `json:"testnet_ws_url"`
+	Symbol                   string    `json:"symbol"`                                // 交易对，如 "BTCUSDT"
+	GridSpacing              float64   `json:"grid_spacing"`                          // 网格间距比例
+	GridValue                float64   `json:"grid_value,omitempty"`                  // 每个网格的交易价值 (USDT)
+	GridQuantity             float64   `json:"grid_quantity,omitempty"`               // 新增：每个网格的交易数量（基础货币）
+	MinNotionalValue         float64   `json:"min_notional_value"`                    // 新增: 交易所最小订单名义价值 (例如 5 USDT)
+	InitialInvestment        float64   `json:"initial_investment"`                    // 初始投资额 (USDT), 用于市价买入
+	Leverage                 int       `json:"leverage"`                              // 杠杆倍数
+	MarginType               string    `json:"margin_type"`                           // 保证金模式: CROSSED 或 ISOLATED
+	PositionMode             string    `json:"position_mode"`                         // 新增: 持仓模式, "Oneway" 或 "Hedge"
+	StopLossRate             float64   `json:"stop_loss_rate,omitempty"`              // 新增: 止损率
+	HedgeMode                bool      `json:"hedge_mode"`                            // 是否开启对冲模式 (双向持仓)
+	GridCount                int       `json:"grid_count"`                            // 网格数量（对）
+	ActiveOrdersCount        int       `json:"active_orders_count"`                   // 在价格两侧各挂的订单数量
+	ReturnRate               float64   `json:"return_rate"`                           // 预期回归价格比例
+	WalletExposureLimit      float64   `json:"wallet_exposure_limit"`                 // 新增：钱包风险暴露上限
+	LogConfig                LogConfig `json:"log"`                                   // 新增：日志配置
+	RetryAttempts            int       `json:"retry_attempts"`                        // 新增: 下单失败时的重试次数
+	RetryInitialDelayMs      int       `json:"retry_initial_delay_ms"`                // 新增: 重试前的初始延迟毫秒数
+	WebSocketPingIntervalSec int       `json:"websocket_ping_interval_sec,omitempty"` // 新增: WebSocket Ping消息发送间隔(秒)
+	WebSocketPongTimeoutSec  int       `json:"websocket_pong_timeout_sec,omitempty"`  // 新增: WebSocket Pong消息超时时间(秒)
 
 	// 回测引擎特定配置
 	TakerFeeRate          float64 `json:"taker_fee_rate"`          // 吃单手续费率
@@ -313,4 +315,45 @@ type OrderUpdateInfo struct {
 	ActivationPrice string `json:"AP"` // Activation Price, only available for TRAILING_STOP_MARKET order
 	CallbackRate    string `json:"cr"` // Callback Rate, only available for TRAILING_STOP_MARKET order
 	RealizedProfit  string `json:"rp"` // Realized Profit of the trade
+}
+
+// GenericEvent 用于初步解析任何WebSocket事件，以获取其类型。
+type GenericEvent struct {
+	EventType interface{} `json:"e"`
+}
+
+// AccountUpdateEvent 代表了 ACCOUNT_UPDATE WebSocket 事件的完整结构。
+type AccountUpdateEvent struct {
+	EventType       string            `json:"e"` // 事件类型
+	EventTime       int64             `json:"E"` // 事件时间
+	TransactionTime int64             `json:"T"` // 撮合引擎交易时间
+	UpdateData      AccountUpdateData `json:"a"` // 账户更新的具体数据
+}
+
+// AccountUpdateData 包含账户更新中的余额和仓位信息。
+type AccountUpdateData struct {
+	Reason    string           `json:"m"` // 事件发生的原因，例如 "ORDER"
+	Balances  []BalanceUpdate  `json:"B"` // 余额更新列表
+	Positions []PositionUpdate `json:"P"` // 仓位更新列表
+}
+
+// BalanceUpdate 代表单个资产的余额更新。
+type BalanceUpdate struct {
+	Asset              string `json:"a"`  // 资产名称
+	WalletBalance      string `json:"wb"` // 钱包余额
+	CrossWalletBalance string `json:"cw"` // 全仓账户钱包余额
+	BalanceChange      string `json:"bc"` // 余额变化（不含盈亏和手续费）
+}
+
+// PositionUpdate 代表单个仓位的更新。
+type PositionUpdate struct {
+	Symbol              string `json:"s"`   // 交易对
+	PositionAmount      string `json:"pa"`  // 仓位数量
+	EntryPrice          string `json:"ep"`  // 开仓均价
+	AccumulatedRealized string `json:"cr"`  // 累计已实现盈亏
+	UnrealizedPnl       string `json:"up"`  // 未实现盈亏
+	MarginType          string `json:"mt"`  // 保证金模式 (cross/isolated)
+	IsolatedWallet      string `json:"iw"`  // 逐仓钱包余额
+	PositionSide        string `json:"ps"`  // 持仓方向 (BOTH, LONG, SHORT)
+	BreakEvenPrice      string `json:"bep"` // 盈亏平衡价
 }

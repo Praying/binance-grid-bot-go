@@ -336,8 +336,23 @@ func (e *LiveExchange) GetAccountInfo() (*models.AccountInfo, error) {
 func (e *LiveExchange) CancelAllOpenOrders(symbol string) error {
 	params := url.Values{}
 	params.Set("symbol", symbol)
-	_, err := e.doRequest("DELETE", "/fapi/v1/allOpenOrders", params, true)
-	return err
+	body, err := e.doRequest("DELETE", "/fapi/v1/allOpenOrders", params, true)
+
+	// 检查特定的“成功”响应，该响应在没有可取消订单时返回
+	if err != nil {
+		// 尝试将错误解析为币安的特定错误结构
+		if binanceErr, ok := err.(*models.Error); ok {
+			// 根据日志，当没有订单可以取消时，币安会返回一个 code 为 200 的 "error"
+			if binanceErr.Code == 200 {
+				e.logger.Info("没有需要取消的挂单。", zap.String("response", string(body)))
+				return nil // 这不是一个真正的错误，操作成功
+			}
+		}
+		// 对于所有其他错误，正常返回
+		return err
+	}
+
+	return nil
 }
 
 // GetOrderStatus 获取订单状态。
