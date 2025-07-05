@@ -317,11 +317,6 @@ type OrderUpdateInfo struct {
 	RealizedProfit  string `json:"rp"` // Realized Profit of the trade
 }
 
-// GenericEvent 用于初步解析任何WebSocket事件，以获取其类型。
-type GenericEvent struct {
-	EventType interface{} `json:"e"`
-}
-
 // AccountUpdateEvent 代表了 ACCOUNT_UPDATE WebSocket 事件的完整结构。
 type AccountUpdateEvent struct {
 	EventType       string            `json:"e"` // 事件类型

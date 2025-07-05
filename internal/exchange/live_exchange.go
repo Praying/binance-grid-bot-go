@@ -80,8 +80,6 @@ func (e *LiveExchange) doRequest(method, endpoint string, params url.Values, sig
 		queryParams.Set("timestamp", fmt.Sprintf("%d", timestamp))
 
 		payloadToSign := queryParams.Encode()
-		e.logger.Info("生成签名的Payload", zap.String("payload", payloadToSign))
-
 		signature := e.sign(payloadToSign)
 		// 将签名附加到已编码的参数字符串中
 		encodedParams = fmt.Sprintf("%s&signature=%s", payloadToSign, signature)
@@ -99,10 +97,8 @@ func (e *LiveExchange) doRequest(method, endpoint string, params url.Values, sig
 		if encodedParams != "" {
 			finalURL = fmt.Sprintf("%s?%s", fullURL, encodedParams)
 		}
-		e.logger.Info("发送GET请求", zap.String("url", finalURL))
 		req, err = http.NewRequest(method, finalURL, nil)
 	} else { // POST, PUT, DELETE
-		e.logger.Info("发送POST/PUT/DELETE请求", zap.String("body", encodedParams))
 		req, err = http.NewRequest(method, fullURL, strings.NewReader(encodedParams))
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	}

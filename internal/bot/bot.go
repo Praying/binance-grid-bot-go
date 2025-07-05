@@ -19,6 +19,21 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// EventType defines the type of a normalized event
+type EventType int
+
+const (
+	OrderUpdateEvent EventType = iota
+	// Add other event types here in the future, e.g., PriceTickEvent
+)
+
+// NormalizedEvent is a standardized internal representation of an event from any source
+type NormalizedEvent struct {
+	Type      EventType
+	Timestamp time.Time
+	Data      interface{} // Can be models.OrderUpdateEvent or other event data structs
+}
+
 // GridTradingBot is the core struct for the grid trading bot
 type GridTradingBot struct {
 	config                  *models.Config
@@ -38,6 +53,7 @@ type GridTradingBot struct {
 	reentrySignal           chan bool
 	mutex                   sync.RWMutex
 	stopChannel             chan bool
+	eventChannel            chan NormalizedEvent // The central event queue
 	symbolInfo              *models.SymbolInfo
 	isHalted                bool
 	safeModeReason          string
@@ -54,6 +70,7 @@ func NewGridTradingBot(config *models.Config, ex exchange.Exchange, isBacktest b
 		IsBacktest:              isBacktest,
 		basePositionEstablished: false,
 		stopChannel:             make(chan bool),
+		eventChannel:            make(chan NormalizedEvent, 1024), // Buffered channel
 		reentrySignal:           make(chan bool, 1),
 		isHalted:                false,
 	}
@@ -614,7 +631,7 @@ func (b *GridTradingBot) monitorStatus() {
 	for {
 		select {
 		case <-ticker.C:
-			b.printStatus()
+			//  b.printStatus()
 		case <-b.stopChannel:
 			logger.S().Info("Status monitor received stop signal, exiting.")
 			return
@@ -814,78 +831,96 @@ func (b *GridTradingBot) syncWithExchange() error {
 
 // handleWebSocketMessage parses and handles messages from the WebSocket
 func (b *GridTradingBot) handleWebSocketMessage(message []byte) {
-	var genericEvent models.GenericEvent
-	if err := json.Unmarshal(message, &genericEvent); err != nil {
-		logger.S().Warnf("Could not unmarshal generic WebSocket event: %v, Raw: %s", err, string(message))
+	var data map[string]interface{}
+	if err := json.Unmarshal(message, &data); err != nil {
+		logger.S().Warnf("Could not unmarshal WebSocket message into map: %v, Raw: %s", err, string(message))
 		return
 	}
 
-	// Safely check the type of the event type field
-	eventType, ok := genericEvent.EventType.(string)
+	eventType, ok := data["e"].(string)
 	if !ok {
-		// This handles cases where 'e' is not a string, logging it for debugging without causing a panic.
-		logger.S().Debugf("Received event with non-string type: %T, value: %v", genericEvent.EventType, genericEvent.EventType)
+		logger.S().Debugf("Received event with non-string or missing event type: %s", string(message))
 		return
 	}
 
 	switch eventType {
 	case "ORDER_TRADE_UPDATE":
-		var event models.OrderUpdateEvent
-		if err := json.Unmarshal(message, &event); err != nil {
+		var orderUpdateEvent models.OrderUpdateEvent
+		if err := json.Unmarshal(message, &orderUpdateEvent); err != nil {
 			logger.S().Warnf("Could not unmarshal order trade update event: %v, Raw: %s", err, string(message))
 			return
 		}
-		b.handleOrderUpdate(event)
+		// Instead of handling it directly, push it to the event channel
+		b.eventChannel <- NormalizedEvent{
+			Type:      OrderUpdateEvent,
+			Timestamp: time.Now(),
+			Data:      orderUpdateEvent,
+		}
 	case "ACCOUNT_UPDATE":
-		// Placeholder for handling account updates if needed in the future
+		// Placeholder for handling account updates if needed in the future.
+		// To implement, create a specific struct for ACCOUNT_UPDATE and unmarshal here.
+	case "TRADE_LITE":
+		// This is a public trade event, not specific to our orders. We can safely ignore it.
 	default:
-		// Ignore other event types like "TRADE_LITE" etc.
+		// Optionally log unknown event types for future analysis, but avoid spamming.
+		// logger.S().Debugf("Received unhandled event type '%s'", eventType)
 	}
 }
 
-// handleOrderUpdate handles order update events
+// handleOrderUpdate is now called sequentially by the event processor.
+// It no longer needs to manage its own concurrency with goroutines or the isRebuilding flag.
 func (b *GridTradingBot) handleOrderUpdate(event models.OrderUpdateEvent) {
-	if event.Order.ExecutionType == "TRADE" && event.Order.Status == "FILLED" {
-		logger.S().Infof("--- WebSocket Received Order Fill Event ---")
-		logger.S().Infof("Order ID: %d, Symbol: %s, Side: %s, Price: %s, Quantity: %s",
-			event.Order.OrderID, event.Order.Symbol, event.Order.Side, event.Order.Price, event.Order.OrigQty)
+	if event.Order.ExecutionType != "TRADE" || event.Order.Status != "FILLED" {
+		return
+	}
 
-		go func(o models.OrderUpdateInfo) {
-			b.mutex.Lock()
-			var triggeredGrid *models.GridLevel
-			for i := range b.gridLevels {
-				if b.gridLevels[i].OrderID == o.OrderID {
-					triggeredGrid = &b.gridLevels[i]
-					break
-				}
-			}
-			b.mutex.Unlock()
+	o := event.Order
+	logger.S().Infof("--- Processing Order Fill Event ---")
+	logger.S().Infof("Order ID: %d, Symbol: %s, Side: %s, Price: %s, Quantity: %s",
+		o.OrderID, o.Symbol, o.Side, o.Price, o.OrigQty)
 
-			if triggeredGrid != nil {
-				logger.S().Infof("Matched active grid order: GridID %d, Price %.4f", triggeredGrid.GridID, triggeredGrid.Price)
-				filledPrice, _ := strconv.ParseFloat(o.Price, 64)
+	var triggeredGrid *models.GridLevel
+	b.mutex.RLock()
+	for i := range b.gridLevels {
+		if b.gridLevels[i].OrderID == o.OrderID {
+			// Create a copy to avoid holding the lock during rebuild
+			gridCopy := b.gridLevels[i]
+			triggeredGrid = &gridCopy
+			break
+		}
+	}
+	b.mutex.RUnlock()
 
-				b.mutex.RLock()
-				reversionPrice := b.reversionPrice
-				b.mutex.RUnlock()
+	if triggeredGrid != nil {
+		logger.S().Infof("Matched active grid order: GridID %d, Price %.4f", triggeredGrid.GridID, triggeredGrid.Price)
+		filledPrice, _ := strconv.ParseFloat(o.Price, 64)
 
-				// Cycle completion check: either the topmost grid is hit, or price exceeds the reversion target.
-				if triggeredGrid.GridID == 0 || filledPrice >= reversionPrice {
-					if triggeredGrid.GridID == 0 {
-						logger.S().Infof("Topmost grid level (GridID 0) filled at price %.4f. Triggering cycle restart.", filledPrice)
-					} else {
-						logger.S().Infof("Price %.4f has reached or exceeded reversion price %.4f. Triggering cycle restart.", filledPrice, reversionPrice)
-					}
-					b.reentrySignal <- true
-				} else {
-					if err := b.rebuildGrid(triggeredGrid.GridID); err != nil {
-						logger.S().Errorf("Grid rebuild goroutine failed: %v", err)
-					}
-				}
+		b.mutex.RLock()
+		reversionPrice := b.reversionPrice
+		b.mutex.RUnlock()
+
+		// Cycle completion check: either the topmost grid is hit, or price exceeds the reversion target.
+		if triggeredGrid.GridID == 0 || filledPrice >= reversionPrice {
+			if triggeredGrid.GridID == 0 {
+				logger.S().Infof("Topmost grid level (GridID 0) filled at price %.4f. Triggering cycle restart.", filledPrice)
 			} else {
-				logger.S().Warnf("Received fill update for order %d, but no matching active grid level found.", o.OrderID)
+				logger.S().Infof("Price %.4f has reached or exceeded reversion price %.4f. Triggering cycle restart.", filledPrice, reversionPrice)
 			}
-		}(event.Order)
+			// Use a non-blocking send in case the strategy loop is not ready
+			select {
+			case b.reentrySignal <- true:
+			default:
+				logger.S().Warn("Re-entry signal channel is full. Cycle restart may be delayed.")
+			}
+		} else {
+			// The core logic to rebuild the grid around the new price
+			if err := b.rebuildGrid(triggeredGrid.GridID); err != nil {
+				// If rebuild fails, we must enter safe mode to prevent further trading with a broken state.
+				b.enterSafeMode(fmt.Sprintf("Failed to rebuild grid after fill of order %d: %v", o.OrderID, err))
+			}
+		}
+	} else {
+		logger.S().Warnf("Received fill update for order %d, but no matching active grid level found. This could be a manually placed order or from a previous session.", o.OrderID)
 	}
 }
 
@@ -1124,4 +1159,35 @@ func (b *GridTradingBot) enterSafeMode(reason string) {
 	logger.S().Errorf("Reason: %s", reason)
 	logger.S().Errorf("Bot has stopped all trading activity. Manual intervention required.")
 	go b.cancelAllActiveOrders()
+}
+
+// eventProcessor is the heart of the bot, processing all events sequentially from a single channel.
+// This architectural choice eliminates race conditions for state modifications.
+func (b *GridTradingBot) eventProcessor() {
+	logger.S().Info("Core event processor started.")
+	for {
+		select {
+		case event := <-b.eventChannel:
+			b.processSingleEvent(event)
+		case <-b.stopChannel:
+			logger.S().Info("Core event processor stopped.")
+			return
+		}
+	}
+}
+
+// processSingleEvent handles a single normalized event.
+// All state-modifying logic should be called from here.
+func (b *GridTradingBot) processSingleEvent(event NormalizedEvent) {
+	switch event.Type {
+	case OrderUpdateEvent:
+		if orderUpdate, ok := event.Data.(models.OrderUpdateEvent); ok {
+			b.handleOrderUpdate(orderUpdate)
+		} else {
+			logger.S().Warnf("Received OrderUpdateEvent with unexpected data type: %T", event.Data)
+		}
+		// Future event types can be handled here
+		// case PriceTickEvent:
+		// ...
+	}
 }
