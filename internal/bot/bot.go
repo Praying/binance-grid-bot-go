@@ -529,6 +529,7 @@ func (b *GridTradingBot) Start() error {
 			return fmt.Errorf("failed to connect to WebSocket on start: %v", err)
 		}
 		go b.webSocketLoop()
+		go b.eventProcessor() // Start the core event processor
 	}
 
 	if err := b.enterMarketAndSetupGrid(); err != nil {
