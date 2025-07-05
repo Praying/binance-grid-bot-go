@@ -122,8 +122,16 @@ func (e *LiveExchange) doRequest(method, endpoint string, params url.Values, sig
 	}
 
 	var binanceError models.Error
+	// 尝试将响应解析为币安的错误结构体
 	if json.Unmarshal(body, &binanceError) == nil && binanceError.Code != 0 {
-		return body, &binanceError
+		// 特殊处理：币安有时会用 code: 200 的“错误”消息体来表示一个成功的操作，
+		// 例如，当没有挂单可以取消时。我们不应将这种情况视为一个真正的错误。
+		if binanceError.Code == 200 {
+			// 这是成功的响应，继续执行，就像没有错误一样
+		} else {
+			// 这是币安返回的一个真正的业务逻辑错误
+			return body, &binanceError
+		}
 	}
 
 	if resp.StatusCode != http.StatusOK {
@@ -334,20 +342,14 @@ func (e *LiveExchange) CancelAllOpenOrders(symbol string) error {
 	params.Set("symbol", symbol)
 	body, err := e.doRequest("DELETE", "/fapi/v1/allOpenOrders", params, true)
 
-	// 检查特定的“成功”响应，该响应在没有可取消订单时返回
+	// 由于 doRequest 已经处理了 code:200 的情况，这里的逻辑可以大大简化。
+	// 如果 err 不为 nil，那么它就是一个需要处理的真实错误。
 	if err != nil {
-		// 尝试将错误解析为币安的特定错误结构
-		if binanceErr, ok := err.(*models.Error); ok {
-			// 根据日志，当没有订单可以取消时，币安会返回一个 code 为 200 的 "error"
-			if binanceErr.Code == 200 {
-				e.logger.Info("没有需要取消的挂单。", zap.String("response", string(body)))
-				return nil // 这不是一个真正的错误，操作成功
-			}
-		}
-		// 对于所有其他错误，正常返回
+		e.logger.Error("取消所有挂单失败", zap.Error(err), zap.String("response", string(body)))
 		return err
 	}
 
+	e.logger.Info("成功取消所有挂单（或无挂单需要取消）。", zap.String("symbol", symbol))
 	return nil
 }
 
