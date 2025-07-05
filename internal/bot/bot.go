@@ -86,7 +86,7 @@ func (b *GridTradingBot) establishBasePositionAndWait(quantity float64) (float64
 	}
 	logger.S().Infof("Submitted initial market buy order ID: %d, Quantity: %.5f. Waiting for fill...", order.OrderId, quantity)
 
-	ticker := time.NewTicker(500 * time.Millisecond)
+	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 	timeout := time.After(2 * time.Minute)
 
@@ -170,7 +170,7 @@ func (b *GridTradingBot) enterMarketAndSetupGrid() error {
 		if len(b.conceptualGrid) == 0 || b.conceptualGrid[len(b.conceptualGrid)-1] != adjustedPrice {
 			b.conceptualGrid = append(b.conceptualGrid, adjustedPrice)
 		}
-		price *= (1 - b.config.GridSpacing)
+		price *= 1 - b.config.GridSpacing
 	}
 	b.mutex.Unlock()
 
@@ -384,9 +384,14 @@ func (b *GridTradingBot) connectWebSocket() error {
 	if pongTimeout == 0 {
 		pongTimeout = 75 * time.Second // Default value
 	}
-	b.wsConn.SetReadDeadline(time.Now().Add(pongTimeout))
+	if err = b.wsConn.SetReadDeadline(time.Now().Add(pongTimeout)); err != nil {
+		return err
+	}
+
 	b.wsConn.SetPongHandler(func(string) error {
-		b.wsConn.SetReadDeadline(time.Now().Add(pongTimeout))
+		if err := b.wsConn.SetReadDeadline(time.Now().Add(pongTimeout)); err != nil {
+			return err
+		}
 		return nil
 	})
 
@@ -439,7 +444,7 @@ func (b *GridTradingBot) webSocketLoop() {
 	// Ping Ticker
 	pingInterval := time.Duration(b.config.WebSocketPingIntervalSec) * time.Second
 	if pingInterval == 0 {
-		pingInterval = 60 * time.Second // Default value
+		pingInterval = 30 * time.Second // Default value
 	}
 	pingTicker := time.NewTicker(pingInterval)
 	defer pingTicker.Stop()
@@ -453,7 +458,6 @@ func (b *GridTradingBot) webSocketLoop() {
 		case <-pingTicker.C:
 			if err := b.wsConn.WriteMessage(websocket.PingMessage, nil); err != nil {
 				logger.S().Warnf("Failed to send WebSocket ping: %v", err)
-				// The read deadline will handle the timeout
 			}
 		case err := <-errChannel:
 			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
@@ -705,7 +709,7 @@ func (b *GridTradingBot) generateClientOrderID() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("x-Roo-%s", id), nil
+	return fmt.Sprintf("x-grid-%s", id), nil
 }
 
 // isWithinExposureLimit checks if adding a trade would exceed the wallet exposure limit
@@ -865,11 +869,16 @@ func (b *GridTradingBot) handleOrderUpdate(event models.OrderUpdateEvent) {
 				reversionPrice := b.reversionPrice
 				b.mutex.RUnlock()
 
-				if filledPrice >= reversionPrice {
-					logger.S().Infof("Price %.4f has reached or exceeded reversion price %.4f. Triggering cycle restart.", filledPrice, reversionPrice)
+				// Cycle completion check: either the topmost grid is hit, or price exceeds the reversion target.
+				if triggeredGrid.GridID == 0 || filledPrice >= reversionPrice {
+					if triggeredGrid.GridID == 0 {
+						logger.S().Infof("Topmost grid level (GridID 0) filled at price %.4f. Triggering cycle restart.", filledPrice)
+					} else {
+						logger.S().Infof("Price %.4f has reached or exceeded reversion price %.4f. Triggering cycle restart.", filledPrice, reversionPrice)
+					}
 					b.reentrySignal <- true
 				} else {
-					if err := b.rebuildGrid(filledPrice); err != nil {
+					if err := b.rebuildGrid(triggeredGrid.GridID); err != nil {
 						logger.S().Errorf("Grid rebuild goroutine failed: %v", err)
 					}
 				}
@@ -880,9 +889,8 @@ func (b *GridTradingBot) handleOrderUpdate(event models.OrderUpdateEvent) {
 	}
 }
 
-// rebuildGrid is the core function for building the 3x3 grid around a center price.
-func (b *GridTradingBot) rebuildGrid(centerPrice float64) error {
-	logger.S().Infof("--- Starting grid rebuild, center price: %.4f ---", centerPrice)
+func (b *GridTradingBot) rebuildGrid(pivotGridID int) error {
+	logger.S().Infof("--- Starting grid rebuild, pivot GridID: %d ---", pivotGridID)
 
 	logger.S().Info("Step 1/3: Cancelling all existing orders...")
 	if err := b.exchange.CancelAllOpenOrders(b.config.Symbol); err != nil {
@@ -893,7 +901,7 @@ func (b *GridTradingBot) rebuildGrid(centerPrice float64) error {
 
 	logger.S().Info("Step 2/3: Waiting for exchange to confirm all orders are cancelled...")
 	timeout := time.After(30 * time.Second)
-	ticker := time.NewTicker(500 * time.Millisecond)
+	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -926,60 +934,54 @@ allCancelled:
 	b.mutex.Unlock()
 
 	b.mutex.RLock()
-	pivotGridID := -1
-	minDiff := math.MaxFloat64
-	for i, p := range b.conceptualGrid {
-		if math.Abs(p-centerPrice) < minDiff {
-			minDiff = math.Abs(p - centerPrice)
-			pivotGridID = i
-		}
-	}
 	conceptualGridCopy := make([]float64, len(b.conceptualGrid))
 	copy(conceptualGridCopy, b.conceptualGrid)
 	activeOrdersCount := b.config.ActiveOrdersCount
 	b.mutex.RUnlock()
 
-	if pivotGridID == -1 {
-		reason := fmt.Sprintf("could not find pivot grid ID for center price %.4f", centerPrice)
+	if pivotGridID < 0 || pivotGridID >= len(conceptualGridCopy) {
+		reason := fmt.Sprintf("invalid pivotGridID: %d", pivotGridID)
 		b.enterSafeMode(reason)
 		return errors.New(reason)
 	}
-	logger.S().Infof("Found closest pivot grid ID: %d (Price: %.4f)", pivotGridID, conceptualGridCopy[pivotGridID])
+	logger.S().Infof("Using pivot GridID: %d (Price: %.4f)", pivotGridID, conceptualGridCopy[pivotGridID])
 
 	var wg sync.WaitGroup
 	newOrdersChan := make(chan *models.GridLevel, activeOrdersCount*2)
 	errChan := make(chan error, activeOrdersCount*2)
 
-	// Place sell orders
+	// Place sell orders above the pivot
 	for i := 1; i <= activeOrdersCount; i++ {
-		index := pivotGridID - i
-		if index >= 0 && index < len(conceptualGridCopy) {
-			wg.Add(1)
-			go func(price float64, gridID int) {
-				defer wg.Done()
-				if order, err := b.placeNewOrder("SELL", price, gridID); err != nil {
-					errChan <- fmt.Errorf("failed to place sell order (GridID %d): %v", gridID, err)
-				} else {
-					newOrdersChan <- order
-				}
-			}(conceptualGridCopy[index], index)
+		sellIndex := pivotGridID - i
+		if sellIndex < 0 {
+			break // Reached the top of the conceptual grid
 		}
+		wg.Add(1)
+		go func(price float64, gridID int) {
+			defer wg.Done()
+			if order, err := b.placeNewOrder("SELL", price, gridID); err != nil {
+				errChan <- fmt.Errorf("failed to place sell order (GridID %d): %v", gridID, err)
+			} else {
+				newOrdersChan <- order
+			}
+		}(conceptualGridCopy[sellIndex], sellIndex)
 	}
 
-	// Place buy orders
+	// Place buy orders below the pivot
 	for i := 1; i <= activeOrdersCount; i++ {
-		index := pivotGridID + i
-		if index >= 0 && index < len(conceptualGridCopy) {
-			wg.Add(1)
-			go func(price float64, gridID int) {
-				defer wg.Done()
-				if order, err := b.placeNewOrder("BUY", price, gridID); err != nil {
-					errChan <- fmt.Errorf("failed to place buy order (GridID %d): %v", gridID, err)
-				} else {
-					newOrdersChan <- order
-				}
-			}(conceptualGridCopy[index], index)
+		buyIndex := pivotGridID + i
+		if buyIndex >= len(conceptualGridCopy) {
+			break // Reached the bottom of the conceptual grid
 		}
+		wg.Add(1)
+		go func(price float64, gridID int) {
+			defer wg.Done()
+			if order, err := b.placeNewOrder("BUY", price, gridID); err != nil {
+				errChan <- fmt.Errorf("failed to place buy order (GridID %d): %v", gridID, err)
+			} else {
+				newOrdersChan <- order
+			}
+		}(conceptualGridCopy[buyIndex], buyIndex)
 	}
 
 	wg.Wait()
@@ -994,10 +996,15 @@ allCancelled:
 		logger.S().Error(err)
 	}
 
-	b.mutex.Lock()
+	// Collect new orders into a temporary slice first.
+	newGridLevels := make([]models.GridLevel, 0, activeOrdersCount*2)
 	for order := range newOrdersChan {
-		b.gridLevels = append(b.gridLevels, *order)
+		newGridLevels = append(newGridLevels, *order)
 	}
+
+	// Now, update the shared state under a single lock.
+	b.mutex.Lock()
+	b.gridLevels = newGridLevels
 	b.mutex.Unlock()
 
 	if finalError != nil {

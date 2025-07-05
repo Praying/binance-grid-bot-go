@@ -71,7 +71,6 @@ func main() {
 	logger.InitLogger(cfg.LogConfig)
 	defer logger.S().Sync() // 确保在main函数退出时刷新所有缓冲的日志
 
-	// --- 根据模式执行 ---
 	switch *mode {
 	case "live":
 		runLiveMode(cfg)
@@ -158,23 +157,23 @@ func runLiveMode(cfg *models.Config) {
 	logger.S().Info("正在初始化交易所设置...")
 
 	// 1. 设置持仓模式 (单向/双向)
-	// --- 隔离测试：调用另一个需要签名的GET接口来验证签名逻辑 ---
 	if _, err := liveExchange.GetAccountInfo(); err != nil {
-		logger.S().Fatalf("[调试] 调用 GetAccountInfo 失败: %v", err)
+		logger.S().Fatalf(" 调用 GetAccountInfo 失败: %v", err)
+		return
 	}
-	logger.S().Info("[调试] 调用 GetAccountInfo 成功！签名逻辑可能没有问题。")
-	// --- 测试结束 ---
 
 	// 1. 设置持仓模式 (单向/双向)
 	currentHedgeMode, err := liveExchange.GetPositionMode()
 	if err != nil {
 		logger.S().Fatalf("获取当前持仓模式失败: %v", err)
+		return
 	}
 
 	if currentHedgeMode != cfg.HedgeMode {
 		logger.S().Infof("当前持仓模式 (HedgeMode=%v) 与配置 (HedgeMode=%v) 不符，正在尝试更新...", currentHedgeMode, cfg.HedgeMode)
 		if err := liveExchange.SetPositionMode(cfg.HedgeMode); err != nil {
 			logger.S().Fatalf("设置持仓模式失败: %v", err)
+			return
 		}
 		logger.S().Infof("持仓模式成功更新为: HedgeMode=%v", cfg.HedgeMode)
 	} else {
@@ -185,6 +184,7 @@ func runLiveMode(cfg *models.Config) {
 	currentMarginType, err := liveExchange.GetMarginType(cfg.Symbol)
 	if err != nil {
 		logger.S().Fatalf("获取当前保证金模式失败: %v", err)
+		return
 	}
 
 	// 比较时忽略大小写
@@ -192,6 +192,7 @@ func runLiveMode(cfg *models.Config) {
 		logger.S().Infof("当前保证金模式 (%s) 与配置 (%s) 不符，正在尝试更新...", currentMarginType, cfg.MarginType)
 		if err := liveExchange.SetMarginType(cfg.Symbol, cfg.MarginType); err != nil {
 			logger.S().Fatalf("设置保证金模式失败: %v", err)
+			return
 		}
 		logger.S().Infof("保证金模式成功更新为: %s", cfg.MarginType)
 	} else {
@@ -204,6 +205,7 @@ func runLiveMode(cfg *models.Config) {
 	// 启动机器人
 	if err := gridBot.Start(); err != nil {
 		logger.S().Fatalf("机器人启动失败: %v", err)
+		return
 	}
 
 	// 等待中断信号以实现优雅退出
