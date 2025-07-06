@@ -17,6 +17,7 @@ require (
 	github.com/jpillora/backoff v1.0.0 // indirect
 	github.com/jxskiss/base62 v1.1.0 // indirect
 	github.com/mattn/go-runewidth v0.0.16 // indirect
+	github.com/mattn/go-sqlite3 v1.14.28 // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/shopspring/decimal v1.4.0 // indirect
 	go.uber.org/multierr v1.10.0 // indirect

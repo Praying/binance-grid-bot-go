@@ -1,5 +1,6 @@
 {
   "is_testnet": true,
+  "db_path": "data/grid_bot.db",
   "live_api_url": "https://fapi.binance.com",
   "live_ws_url": "wss://fstream.binance.com",
   "testnet_api_url": "https://testnet.binancefuture.com",

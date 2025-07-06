@@ -2,8 +2,10 @@ package exchange
 
 import (
 	"binance-grid-bot-go/internal/models"
+	"binance-grid-bot-go/internal/storage"
 	"crypto/hmac"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -12,10 +14,25 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
+)
+
+// ExchangeStatus 定义了交易所的状态
+type ExchangeStatus int32
+
+const (
+	// StatusInitializing 初始状态
+	StatusInitializing ExchangeStatus = iota
+	// StatusRecovering 正在从重启中恢复订单
+	StatusRecovering
+	// StatusRunning 正常运行中
+	StatusRunning
+	// StatusStopped 已停止
+	StatusStopped
 )
 
 // LiveExchange 实现了 Exchange 接口，用于与真实的币安交易所进行交互。
@@ -30,10 +47,12 @@ type LiveExchange struct {
 	wsConn     *websocket.Conn
 	listenKey  string
 	timeOffset int64
+	status     atomic.Value // 使用 atomic.Value 来保证并发安全
+	db         *sql.DB      // 数据库连接
 }
 
 // NewLiveExchange 创建一个新的 LiveExchange 实例，并与服务器同步时间。
-func NewLiveExchange(apiKey, secretKey, baseURL, wsBaseURL string, logger *zap.Logger) (*LiveExchange, error) {
+func NewLiveExchange(apiKey, secretKey, baseURL, wsBaseURL string, logger *zap.Logger, db *sql.DB) (*LiveExchange, error) {
 	e := &LiveExchange{
 		apiKey:     apiKey,
 		secretKey:  secretKey,
@@ -41,7 +60,9 @@ func NewLiveExchange(apiKey, secretKey, baseURL, wsBaseURL string, logger *zap.L
 		wsBaseURL:  wsBaseURL,
 		httpClient: &http.Client{Timeout: 10 * time.Second},
 		logger:     logger,
+		db:         db,
 	}
+	e.status.Store(StatusInitializing)
 
 	if err := e.syncTime(); err != nil {
 		return nil, fmt.Errorf("与币安服务器同步时间失败: %v", err)
@@ -64,7 +85,6 @@ func (e *LiveExchange) syncTime() error {
 
 // doRequest 是一个通用的请求处理函数，用于向币安API发送请求。
 func (e *LiveExchange) doRequest(method, endpoint string, params url.Values, signed bool) ([]byte, error) {
-	// 1. 准备基础 URL 和参数
 	fullURL := fmt.Sprintf("%s%s", e.baseURL, endpoint)
 	queryParams := url.Values{}
 	if params != nil {
@@ -75,20 +95,16 @@ func (e *LiveExchange) doRequest(method, endpoint string, params url.Values, sig
 
 	var encodedParams string
 	if signed {
-		// 2. 对于签名请求，添加时间戳并生成签名
 		timestamp := time.Now().UnixMilli() + e.timeOffset
 		queryParams.Set("timestamp", fmt.Sprintf("%d", timestamp))
 
 		payloadToSign := queryParams.Encode()
 		signature := e.sign(payloadToSign)
-		// 将签名附加到已编码的参数字符串中
 		encodedParams = fmt.Sprintf("%s&signature=%s", payloadToSign, signature)
 	} else {
-		// 对于非签名请求，直接编码
 		encodedParams = queryParams.Encode()
 	}
 
-	// 3. 根据请求方法创建请求
 	var req *http.Request
 	var err error
 
@@ -107,7 +123,6 @@ func (e *LiveExchange) doRequest(method, endpoint string, params url.Values, sig
 		return nil, fmt.Errorf("创建请求失败: %v", err)
 	}
 
-	// 4. 添加API Key并执行请求
 	req.Header.Set("X-MBX-APIKEY", e.apiKey)
 	resp, err := e.httpClient.Do(req)
 	if err != nil {
@@ -115,28 +130,21 @@ func (e *LiveExchange) doRequest(method, endpoint string, params url.Values, sig
 	}
 	defer resp.Body.Close()
 
-	// 5. 读取和处理响应
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("读取响应体失败: %v", err)
 	}
 
 	var binanceError models.Error
-	// 尝试将响应解析为币安的错误结构体
 	if json.Unmarshal(body, &binanceError) == nil && binanceError.Code != 0 {
-		// 特殊处理：币安有时会用 code: 200 的“错误”消息体来表示一个成功的操作，
-		// 例如，当没有挂单可以取消时。我们不应将这种情况视为一个真正的错误。
 		if binanceError.Code == 200 {
-			// 这是成功的响应，继续执行，就像没有错误一样
+			// This is a success response, continue as if no error
 		} else {
-			// 这是币安返回的一个真正的业务逻辑错误
 			return body, &binanceError
 		}
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		// 当API返回非200状态码时，我们将响应体和错误一起返回
-		// 以便上层调用者可以记录详细的错误信息。
 		return body, fmt.Errorf("API请求失败, 状态码: %d, 响应: %s", resp.StatusCode, string(body))
 	}
 
@@ -185,7 +193,6 @@ func (e *LiveExchange) GetPositions(symbol string) ([]models.Position, error) {
 		return nil, err
 	}
 
-	// 过滤掉没有持仓的条目
 	var activePositions []models.Position
 	for _, p := range positions {
 		posAmt, _ := strconv.ParseFloat(p.PositionAmt, 64)
@@ -199,6 +206,9 @@ func (e *LiveExchange) GetPositions(symbol string) ([]models.Position, error) {
 
 // PlaceOrder 下单。
 func (e *LiveExchange) PlaceOrder(symbol, side, orderType string, quantity, price float64, clientOrderID string) (*models.Order, error) {
+	if e.status.Load() != StatusRunning {
+		return nil, fmt.Errorf("交易所未处于运行状态，当前状态: %v", e.status.Load())
+	}
 	params := url.Values{}
 	params.Set("symbol", symbol)
 	params.Set("side", side)
@@ -206,7 +216,7 @@ func (e *LiveExchange) PlaceOrder(symbol, side, orderType string, quantity, pric
 	params.Set("quantity", fmt.Sprintf("%f", quantity))
 
 	if orderType == "LIMIT" {
-		params.Set("timeInForce", "GTC") // Good Till Cancel
+		params.Set("timeInForce", "GTC")
 		params.Set("price", fmt.Sprintf("%f", price))
 	}
 	if clientOrderID != "" {
@@ -215,7 +225,6 @@ func (e *LiveExchange) PlaceOrder(symbol, side, orderType string, quantity, pric
 
 	data, err := e.doRequest("POST", "/fapi/v1/order", params, true)
 	if err != nil {
-		// 当 doRequest 返回错误时，第一个返回值是响应体 body，第二个是 error
 		e.logger.Error("下单请求失败，交易所返回错误", zap.Error(err), zap.String("raw_response", string(data)))
 		return nil, err
 	}
@@ -229,12 +238,29 @@ func (e *LiveExchange) PlaceOrder(symbol, side, orderType string, quantity, pric
 }
 
 // CancelOrder 取消订单。
-func (e *LiveExchange) CancelOrder(symbol string, orderID int64) error {
+func (e *LiveExchange) CancelOrder(symbol string, orderID int64, clientOrderID string) (*models.Order, error) {
+	currentStatus := e.status.Load().(ExchangeStatus)
+	if currentStatus != StatusRunning && currentStatus != StatusRecovering {
+		return nil, fmt.Errorf("交易所未处于可执行取消操作的状态，当前状态: %v", currentStatus)
+	}
 	params := url.Values{}
 	params.Set("symbol", symbol)
-	params.Set("orderId", strconv.FormatInt(orderID, 10))
-	_, err := e.doRequest("DELETE", "/fapi/v1/order", params, true)
-	return err
+	if orderID > 0 {
+		params.Set("orderId", strconv.FormatInt(orderID, 10))
+	} else if clientOrderID != "" {
+		params.Set("origClientOrderId", clientOrderID)
+	} else {
+		return nil, fmt.Errorf("取消订单需要 orderID 或 clientOrderID")
+	}
+	data, err := e.doRequest("DELETE", "/fapi/v1/order", params, true)
+	if err != nil {
+		return nil, err
+	}
+	var order models.Order
+	if err := json.Unmarshal(data, &order); err != nil {
+		return nil, err
+	}
+	return &order, nil
 }
 
 // SetLeverage 设置杠杆。
@@ -252,7 +278,6 @@ func (e *LiveExchange) SetPositionMode(isHedgeMode bool) error {
 	params.Set("dualSidePosition", fmt.Sprintf("%v", isHedgeMode))
 	_, err := e.doRequest("POST", "/fapi/v1/positionSide/dual", params, true)
 
-	// 如果错误是币安的特定错误，并且错误码是 -4059 (无需更改), 则忽略该错误
 	if err != nil {
 		if binanceErr, ok := err.(*models.Error); ok && binanceErr.Code == -4059 {
 			e.logger.Info("持仓模式无需更改，已是目标模式。")
@@ -284,19 +309,18 @@ func (e *LiveExchange) GetPositionMode() (bool, error) {
 func (e *LiveExchange) SetMarginType(symbol string, marginType string) error {
 	params := url.Values{}
 	params.Set("symbol", symbol)
-	params.Set("marginType", marginType) // "ISOLATED" or "CROSSED"
+	params.Set("marginType", marginType)
 	_, err := e.doRequest("POST", "/fapi/v1/marginType", params, true)
 
-	// 如果错误是币安的特定错误，并且错误码是 -4046 (No need to change margin type), 则忽略该错误
 	if err != nil {
 		if binanceErr, ok := err.(*models.Error); ok && binanceErr.Code == -4046 {
 			e.logger.Info("保证金模式无需更改，已是目标模式。")
-			return nil // 忽略此错误，因为已经是目标状态
+			return nil
 		}
-		return err // 返回其他所有未处理的错误
+		return err
 	}
 
-	return nil // 没有错误，成功
+	return nil
 }
 
 // GetMarginType 获取指定交易对的保证金模式。
@@ -317,8 +341,6 @@ func (e *LiveExchange) GetMarginType(symbol string) (string, error) {
 		return "", fmt.Errorf("API未返回交易对 %s 的持仓风险信息", symbol)
 	}
 
-	// 保证金模式是针对交易对的，所以取第一个结果即可。
-	// API返回的是小写 (e.g., "cross", "isolated")，配置中是大写，因此需要转换。
 	return strings.ToUpper(positions[0].MarginType), nil
 }
 
@@ -342,8 +364,6 @@ func (e *LiveExchange) CancelAllOpenOrders(symbol string) error {
 	params.Set("symbol", symbol)
 	body, err := e.doRequest("DELETE", "/fapi/v1/allOpenOrders", params, true)
 
-	// 由于 doRequest 已经处理了 code:200 的情况，这里的逻辑可以大大简化。
-	// 如果 err 不为 nil，那么它就是一个需要处理的真实错误。
 	if err != nil {
 		e.logger.Error("取消所有挂单失败", zap.Error(err), zap.String("response", string(body)))
 		return err
@@ -354,10 +374,16 @@ func (e *LiveExchange) CancelAllOpenOrders(symbol string) error {
 }
 
 // GetOrderStatus 获取订单状态。
-func (e *LiveExchange) GetOrderStatus(symbol string, orderID int64) (*models.Order, error) {
+func (e *LiveExchange) GetOrderStatus(symbol string, orderID int64, clientOrderID string) (*models.Order, error) {
 	params := url.Values{}
 	params.Set("symbol", symbol)
-	params.Set("orderId", strconv.FormatInt(orderID, 10))
+	if orderID > 0 {
+		params.Set("orderId", strconv.FormatInt(orderID, 10))
+	} else if clientOrderID != "" {
+		params.Set("origClientOrderId", clientOrderID)
+	} else {
+		return nil, fmt.Errorf("查询订单状态需要 orderID 或 clientOrderID")
+	}
 	data, err := e.doRequest("GET", "/fapi/v1/order", params, true)
 	if err != nil {
 		return nil, err
@@ -370,12 +396,12 @@ func (e *LiveExchange) GetOrderStatus(symbol string, orderID int64) (*models.Ord
 	return &order, nil
 }
 
-// GetCurrentTime 返回当前时间。在真实交易中，我们直接返回系统时间。
+// GetCurrentTime 返回当前时间。
 func (e *LiveExchange) GetCurrentTime() time.Time {
 	return time.Now()
 }
 
-// GetAccountState 获取账户状态，包括总持仓价值和账户总权益
+// GetAccountState 获取账户状态。
 func (e *LiveExchange) GetAccountState(symbol string) (positionValue float64, accountEquity float64, err error) {
 	accInfo, err := e.GetAccountInfo()
 	if err != nil {
@@ -401,9 +427,8 @@ func (e *LiveExchange) GetAccountState(symbol string) (positionValue float64, ac
 	return totalPositionValue, equity, nil
 }
 
-// GetSymbolInfo 获取交易对的交易规则
+// GetSymbolInfo 获取交易对的交易规则。
 func (e *LiveExchange) GetSymbolInfo(symbol string) (*models.SymbolInfo, error) {
-	// 【关键修复】获取交易所信息时不应传递任何参数，以获取所有交易对的完整列表
 	data, err := e.doRequest("GET", "/fapi/v1/exchangeInfo", nil, false)
 	if err != nil {
 		return nil, err
@@ -423,7 +448,7 @@ func (e *LiveExchange) GetSymbolInfo(symbol string) (*models.SymbolInfo, error) 
 	return nil, fmt.Errorf("未找到交易对 %s 的信息", symbol)
 }
 
-// GetOpenOrders 获取所有挂单
+// GetOpenOrders 获取所有挂单。
 func (e *LiveExchange) GetOpenOrders(symbol string) ([]models.Order, error) {
 	params := url.Values{}
 	params.Set("symbol", symbol)
@@ -439,7 +464,7 @@ func (e *LiveExchange) GetOpenOrders(symbol string) ([]models.Order, error) {
 	return openOrders, nil
 }
 
-// GetServerTime 获取服务器时间
+// GetServerTime 获取服务器时间。
 func (e *LiveExchange) GetServerTime() (int64, error) {
 	data, err := e.doRequest("GET", "/fapi/v1/time", nil, false)
 	if err != nil {
@@ -454,11 +479,11 @@ func (e *LiveExchange) GetServerTime() (int64, error) {
 	return serverTime.ServerTime, nil
 }
 
-// GetLastTrade 获取最新成交
+// GetLastTrade 获取最新成交。
 func (e *LiveExchange) GetLastTrade(symbol string, orderID int64) (*models.Trade, error) {
 	params := url.Values{}
 	params.Set("symbol", symbol)
-	params.Set("limit", "1") // 我们只需要最新的那笔成交
+	params.Set("limit", "1")
 	data, err := e.doRequest("GET", "/fapi/v1/userTrades", params, true)
 	if err != nil {
 		return nil, err
@@ -476,7 +501,7 @@ func (e *LiveExchange) GetLastTrade(symbol string, orderID int64) (*models.Trade
 	return nil, fmt.Errorf("未找到订单 %d 的成交记录", orderID)
 }
 
-// GetMaxWalletExposure 在真实交易中不适用，返回0
+// GetMaxWalletExposure 在真实交易中不适用。
 func (e *LiveExchange) GetMaxWalletExposure() float64 {
 	return 0
 }
@@ -500,45 +525,167 @@ func (e *LiveExchange) CreateListenKey() (string, error) {
 
 // KeepAliveListenKey 延长 listenKey 的有效期。
 func (e *LiveExchange) KeepAliveListenKey(listenKey string) error {
-	params := url.Values{}
-	params.Set("listenKey", listenKey)
-	_, err := e.doRequest("PUT", "/fapi/v1/listenKey", params, true)
-	if err != nil {
-		return fmt.Errorf("保持 listenKey 存活失败: %v", err)
-	}
-	return nil
+	_, err := e.doRequest("PUT", "/fapi/v1/listenKey", nil, true)
+	return err
 }
 
-// GetBalance 获取账户中特定资产的余额
+// GetBalance 获取账户余额。
 func (e *LiveExchange) GetBalance() (float64, error) {
-	data, err := e.doRequest("GET", "/fapi/v2/balance", nil, true)
+	info, err := e.GetAccountInfo()
 	if err != nil {
-		return 0, fmt.Errorf("获取账户余额失败: %v", err)
+		return 0, err
+	}
+	balance, err := strconv.ParseFloat(info.TotalWalletBalance, 64)
+	if err != nil {
+		return 0, err
+	}
+	return balance, nil
+}
+
+// Recover 实现了订单恢复逻辑。
+func (e *LiveExchange) Recover(symbol string) error {
+	e.status.Store(StatusRecovering)
+	e.logger.Info("开始执行订单恢复流程...")
+
+	// Step 1: 从数据库加载本地活跃订单
+	localOrders, err := storage.GetActiveOrders(e.db, symbol)
+	if err != nil {
+		e.status.Store(StatusStopped)
+		return fmt.Errorf("恢复流程失败：无法从数据库加载本地订单: %w", err)
+	}
+	localOrderMap := make(map[string]*models.Order)
+	for i := range localOrders {
+		localOrderMap[localOrders[i].ClientOrderId] = &localOrders[i]
 	}
 
-	var balances []models.Balance
-	if err := json.Unmarshal(data, &balances); err != nil {
-		return 0, fmt.Errorf("解析余额数据失败: %v", err)
+	// Step 2: 从交易所获取所有开放订单
+	exchangeOrders, err := e.GetOpenOrders(symbol)
+	if err != nil {
+		e.status.Store(StatusStopped)
+		return fmt.Errorf("恢复流程失败：无法从交易所获取开放订单: %w", err)
 	}
 
-	// 通常我们关心 USDT 的余额作为保证金和计价货币
-	for _, b := range balances {
-		if b.Asset == "USDT" {
-			return strconv.ParseFloat(b.AvailableBalance, 64)
+	// Step 3: 订单双向核对与同步
+	for _, exchangeOrder := range exchangeOrders {
+		if _, exists := localOrderMap[exchangeOrder.ClientOrderId]; exists {
+			// 情况A: 订单双边匹配
+			e.logger.Info("恢复流程：匹配到订单", zap.String("clientOrderId", exchangeOrder.ClientOrderId))
+			delete(localOrderMap, exchangeOrder.ClientOrderId)
+		} else {
+			// 情况C: 交易所存在，本地不存在 (孤儿订单)
+			e.logger.Warn("恢复流程：发现孤儿订单，将立即取消", zap.String("clientOrderId", exchangeOrder.ClientOrderId), zap.Int64("exchangeOrderId", exchangeOrder.OrderId))
+			_, cancelErr := e.CancelOrder(symbol, 0, exchangeOrder.ClientOrderId)
+			if cancelErr != nil {
+				e.logger.Error("恢复流程：取消孤儿订单失败", zap.Error(cancelErr))
+			}
 		}
 	}
 
-	return 0, fmt.Errorf("未找到 USDT 余额")
+	// 情况B: 本地存在，交易所不存在
+	for clientOrderID, localOrder := range localOrderMap {
+		e.logger.Info("恢复流程：本地订单在交易所不存在，查询最终状态...", zap.String("clientOrderId", clientOrderID))
+		finalOrder, queryErr := e.GetOrderStatus(symbol, localOrder.OrderId, clientOrderID)
+		if queryErr != nil {
+			e.logger.Error("恢复流程：查询订单最终状态失败", zap.Error(queryErr), zap.String("clientOrderId", clientOrderID))
+			continue
+		}
+		if err := storage.UpdateOrder(e.db, finalOrder); err != nil {
+			e.logger.Error("恢复流程：更新订单到数据库失败", zap.Error(err), zap.String("clientOrderId", clientOrderID))
+		}
+	}
+
+	e.logger.Info("订单恢复流程完成。")
+	e.status.Store(StatusRunning)
+	return nil
 }
 
-// ConnectWebSocket 建立到币安用户数据流的 WebSocket 连接
+// ConnectWebSocket 建立与币安 WebSocket API 的连接。
 func (e *LiveExchange) ConnectWebSocket(listenKey string) (*websocket.Conn, error) {
-	// 正确的 WebSocket URL 格式是 wss://<wsBaseURL>/ws/<listenKey>
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.wsConn != nil {
+		e.logger.Info("WebSocket connection already established.")
+		return e.wsConn, nil
+	}
+
 	wsURL := fmt.Sprintf("%s/ws/%s", e.wsBaseURL, listenKey)
 	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
 	if err != nil {
-		return nil, fmt.Errorf("无法连接到 WebSocket: %v", err)
+		e.logger.Error("Failed to connect to WebSocket", zap.Error(err), zap.String("url", wsURL))
+		return nil, fmt.Errorf("failed to dial websocket: %w", err)
 	}
+
 	e.wsConn = conn
-	return conn, nil
+	e.listenKey = listenKey
+	e.logger.Info("WebSocket connection established successfully.")
+
+	// Start a goroutine to handle ping/pong and keep the connection alive
+	go e.handleWebSocketConnection()
+
+	return e.wsConn, nil
+}
+
+// handleWebSocketConnection 负责处理 WebSocket 连接的生命周期，包括 ping/pong 和自动重连。
+func (e *LiveExchange) handleWebSocketConnection() {
+	defer func() {
+		e.mu.Lock()
+		if e.wsConn != nil {
+			e.wsConn.Close()
+			e.wsConn = nil
+		}
+		e.mu.Unlock()
+		e.logger.Info("WebSocket connection closed.")
+	}()
+
+	// Set a read deadline to detect dead connections
+	e.wsConn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	e.wsConn.SetPongHandler(func(string) error {
+		e.wsConn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		return nil
+	})
+
+	// Periodically send pings to the server
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			e.mu.Lock()
+			if e.wsConn == nil {
+				e.mu.Unlock()
+				return
+			}
+			// Send ping message
+			if err := e.wsConn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				e.logger.Error("Error sending ping message", zap.Error(err))
+				e.mu.Unlock()
+				return
+			}
+			e.mu.Unlock()
+		}
+	}
+}
+
+// --- State Persistence Methods ---
+
+// SaveState persists the bot's state into the database.
+func (e *LiveExchange) SaveState(state *models.BotState) error {
+	return storage.SaveBotState(e.db, state)
+}
+
+// LoadState retrieves the bot's state from the database.
+func (e *LiveExchange) LoadState() (*models.BotState, error) {
+	return storage.LoadBotState(e.db)
+}
+
+// ClearState removes the bot's state from the database.
+func (e *LiveExchange) ClearState() error {
+	return storage.ClearBotState(e.db)
+}
+
+// GetNextCycleID retrieves and increments the persistent cycle counter.
+func (e *LiveExchange) GetNextCycleID() (int64, error) {
+	return storage.GetNextCycleID(e.db)
 }

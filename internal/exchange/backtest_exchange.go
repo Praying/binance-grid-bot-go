@@ -43,6 +43,8 @@ type BacktestExchange struct {
 	LiquidationPrice      float64        // 预估爆仓价
 	isLiquidated          bool           // 标记是否已爆仓 (私有)
 	MaxWalletExposure     float64        // 新增：记录回测期间最大的钱包风险暴露
+	savedState            *models.BotState
+	nextCycleID           int64
 }
 
 // NewBacktestExchange 创建一个新的 BacktestExchange 实例。
@@ -72,6 +74,8 @@ func NewBacktestExchange(cfg *models.Config) *BacktestExchange {
 		MinNotionalValue:      cfg.MinNotionalValue,
 		MaxWalletExposure:     0.0,
 		config:                cfg,
+		savedState:            nil,
+		nextCycleID:           0, // Start from 0, first call to GetNextCycleID will return 1
 	}
 }
 
@@ -412,14 +416,25 @@ func (e *BacktestExchange) PlaceOrder(symbol, side, orderType string, quantity, 
 	return order, nil
 }
 
-func (e *BacktestExchange) GetOrderStatus(symbol string, orderID int64) (*models.Order, error) {
+func (e *BacktestExchange) GetOrderStatus(symbol string, orderID int64, clientOrderID string) (*models.Order, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if order, ok := e.orders[orderID]; ok {
-		orderCopy := *order
-		return &orderCopy, nil
+
+	if orderID > 0 {
+		if order, ok := e.orders[orderID]; ok {
+			orderCopy := *order
+			return &orderCopy, nil
+		}
+	} else if clientOrderID != "" {
+		for _, order := range e.orders {
+			if order.ClientOrderId == clientOrderID {
+				orderCopy := *order
+				return &orderCopy, nil
+			}
+		}
 	}
-	return nil, fmt.Errorf("订单 ID %d 在回测中未找到", orderID)
+
+	return nil, fmt.Errorf("订单 ID %d 或客户端 ID %s 在回测中未找到", orderID, clientOrderID)
 }
 
 func (e *BacktestExchange) CancelAllOpenOrders(symbol string) error {
@@ -566,14 +581,40 @@ func (e *BacktestExchange) GetLastTrade(symbol string, orderID int64) (*models.T
 	return nil, fmt.Errorf("回测中没有可用的成交记录")
 }
 
-func (e *BacktestExchange) CancelOrder(symbol string, orderID int64) error {
+func (e *BacktestExchange) CancelOrder(symbol string, orderID int64, clientOrderID string) (*models.Order, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if order, ok := e.orders[orderID]; ok {
-		order.Status = "CANCELED"
-		return nil
+
+	// 优先使用 orderID 查找，其次是 clientOrderID
+	var orderToCancel *models.Order
+	var exists bool
+
+	if orderID > 0 {
+		orderToCancel, exists = e.orders[orderID]
+	} else if clientOrderID != "" {
+		for _, o := range e.orders {
+			if o.ClientOrderId == clientOrderID {
+				orderToCancel = o
+				exists = true
+				break
+			}
+		}
 	}
-	return fmt.Errorf("订单 ID %d 在回测中未找到", orderID)
+
+	if !exists {
+		return nil, fmt.Errorf("回测错误: 尝试取消一个不存在的订单 ID %d 或客户端 ID %s", orderID, clientOrderID)
+	}
+
+	orderToCancel.Status = "CANCELED"
+	// 在回测中，我们可能也想记录更新时间
+	// orderToCancel.UpdateTime = e.currentTime.UnixMilli()
+
+	// 注意：在当前的回测逻辑中，已取消的订单只是被标记，并未从 e.orders 中移除。
+	// 这与 handleFilledOrder 的行为不同，后者会从 e.orders 中移除订单。
+	// 为了保持一致性，可以考虑在这里也将其移除，但这取决于回测报告是否需要这些数据。
+	// 目前，我们只更新状态。
+
+	return orderToCancel, nil
 }
 
 func (e *BacktestExchange) GetBalance() (float64, error) {
@@ -620,4 +661,43 @@ func (e *BacktestExchange) KeepAliveListenKey(listenKey string) error {
 func (e *BacktestExchange) ConnectWebSocket(listenKey string) (*websocket.Conn, error) {
 	// 回测模式下不建立真实的 WebSocket 连接
 	return nil, nil
+}
+
+// --- State Persistence Methods ---
+
+// GetNextCycleID 为回测模拟一个持久化的、原子递增的周期ID。
+func (e *BacktestExchange) GetNextCycleID() (int64, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.nextCycleID++
+	return e.nextCycleID, nil
+}
+
+// SaveState 在回测中将机器人状态保存在内存中。
+func (e *BacktestExchange) SaveState(state *models.BotState) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.savedState = state
+	return nil
+}
+
+// LoadState 在回测中从内存加载机器人状态。
+func (e *BacktestExchange) LoadState() (*models.BotState, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.savedState == nil {
+		// 遵循 storage.LoadBotState 的行为，在未找到状态时返回 (nil, nil)
+		return nil, nil
+	}
+	// 返回一个副本以防止外部修改
+	stateCopy := *e.savedState
+	return &stateCopy, nil
+}
+
+// ClearState 在回测中清除内存中的机器人状态。
+func (e *BacktestExchange) ClearState() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.savedState = nil
+	return nil
 }

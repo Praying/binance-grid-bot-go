@@ -8,9 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"math"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -52,12 +50,15 @@ type GridTradingBot struct {
 	isReentering            bool
 	reentrySignal           chan bool
 	mutex                   sync.RWMutex
+	wsWriteMutex            sync.Mutex
 	stopChannel             chan bool
-	eventChannel            chan NormalizedEvent // The central event queue
+	eventChannel            chan NormalizedEvent
 	symbolInfo              *models.SymbolInfo
 	isHalted                bool
 	safeModeReason          string
 	idGenerator             *idgenerator.IDGenerator
+	initialMarketOrderID    int64
+	botState                *models.BotState
 }
 
 // NewGridTradingBot creates a new instance of the grid trading bot
@@ -101,6 +102,9 @@ func (b *GridTradingBot) establishBasePositionAndWait(quantity float64) (float64
 	if err != nil {
 		return 0, fmt.Errorf("initial market buy failed: %v", err)
 	}
+	b.mutex.Lock()
+	b.initialMarketOrderID = order.OrderId
+	b.mutex.Unlock()
 	logger.S().Infof("Submitted initial market buy order ID: %d, Quantity: %.5f. Waiting for fill...", order.OrderId, quantity)
 
 	ticker := time.NewTicker(1 * time.Second)
@@ -110,7 +114,7 @@ func (b *GridTradingBot) establishBasePositionAndWait(quantity float64) (float64
 	for {
 		select {
 		case <-ticker.C:
-			status, err := b.exchange.GetOrderStatus(b.config.Symbol, order.OrderId)
+			status, err := b.exchange.GetOrderStatus(b.config.Symbol, order.OrderId, order.ClientOrderId)
 			if err != nil {
 				if b.IsBacktest && strings.Contains(err.Error(), "not found") {
 					logger.S().Infof("Initial order %d status check returned 'not found', assuming filled in backtest mode.", order.OrderId)
@@ -157,12 +161,22 @@ func (b *GridTradingBot) establishBasePositionAndWait(quantity float64) (float64
 func (b *GridTradingBot) enterMarketAndSetupGrid() error {
 	logger.S().Info("--- Starting new trading cycle ---")
 
+	// Atomically get the next cycle ID for this new cycle
+	nextCycleID, err := b.exchange.GetNextCycleID()
+	if err != nil {
+		return fmt.Errorf("could not get next cycle ID: %w", err)
+	}
+	logger.S().Infof("Obtained new cycle ID: %d", nextCycleID)
+
 	currentPrice, err := b.exchange.GetPrice(b.config.Symbol)
 	if err != nil {
 		return fmt.Errorf("failed to get current price: %v", err)
 	}
 
 	b.mutex.Lock()
+	b.botState = &models.BotState{
+		CurrentCycleID: nextCycleID,
+	}
 	b.currentPrice = currentPrice
 	b.entryPrice = currentPrice
 	b.reversionPrice = b.entryPrice * (1 + b.config.ReturnRate)
@@ -238,7 +252,17 @@ func (b *GridTradingBot) enterMarketAndSetupGrid() error {
 		if err != nil {
 			return fmt.Errorf("initial grid setup failed: %v", err)
 		}
+		b.mutex.Lock()
+		b.initialMarketOrderID = 0 // Reset after grid is set up
+		b.mutex.Unlock()
 		logger.S().Info("--- New cycle grid setup complete ---")
+
+		// Persist the newly created state
+		if err := b.saveState("RUNNING"); err != nil {
+			return fmt.Errorf("CRITICAL: failed to save initial bot state: %v", err)
+		}
+		logger.S().Info("Successfully saved initial bot state to database.")
+
 	} else {
 		logger.S().Error("CRITICAL: Base position not marked as established, cannot place grid orders.")
 	}
@@ -283,7 +307,7 @@ func (b *GridTradingBot) placeNewOrder(side string, price float64, gridID int) (
 		for {
 			select {
 			case <-ticker.C:
-				status, err := b.exchange.GetOrderStatus(b.config.Symbol, order.OrderId)
+				status, err := b.exchange.GetOrderStatus(b.config.Symbol, order.OrderId, clientOrderID)
 				if err != nil {
 					if strings.Contains(err.Error(), "order does not exist") {
 						logger.S().Warnf("Order %d not found yet, retrying...", order.OrderId)
@@ -473,7 +497,10 @@ func (b *GridTradingBot) webSocketLoop() {
 		case message := <-readChannel:
 			b.handleWebSocketMessage(message)
 		case <-pingTicker.C:
-			if err := b.wsConn.WriteMessage(websocket.PingMessage, nil); err != nil {
+			b.wsWriteMutex.Lock()
+			err := b.wsConn.WriteMessage(websocket.PingMessage, nil)
+			b.wsWriteMutex.Unlock()
+			if err != nil {
 				logger.S().Warnf("Failed to send WebSocket ping: %v", err)
 			}
 		case err := <-errChannel:
@@ -519,22 +546,41 @@ func (b *GridTradingBot) Start() error {
 		b.mutex.Unlock()
 		return fmt.Errorf("bot is already running")
 	}
-	b.isRunning = true
-	b.mutex.Unlock()
 
 	logger.S().Info("Starting bot...")
 
-	if !b.IsBacktest {
-		if err := b.connectWebSocket(); err != nil {
-			return fmt.Errorf("failed to connect to WebSocket on start: %v", err)
-		}
-		go b.webSocketLoop()
-		go b.eventProcessor() // Start the core event processor
+	// Load state from DB before starting
+	if err := b.loadState(); err != nil {
+		b.mutex.Unlock()
+		return fmt.Errorf("failed to load bot state: %v", err)
 	}
 
-	if err := b.enterMarketAndSetupGrid(); err != nil {
-		b.enterSafeMode(fmt.Sprintf("failed to initialize grid and position: %v", err))
-		return fmt.Errorf("failed to initialize grid and position: %v", err)
+	b.isRunning = true
+	b.stopChannel = make(chan bool) // Ensure stopChannel is re-initialized
+	b.mutex.Unlock()
+
+	if !b.IsBacktest {
+		if err := b.connectWebSocket(); err != nil {
+			return fmt.Errorf("failed to start bot: %v", err)
+		}
+		go b.webSocketLoop()
+		go b.eventProcessor()
+	}
+
+	// Decide whether to recover or start fresh
+	if b.botState != nil && b.botState.Status == "RUNNING" {
+		logger.S().Info("Found previous RUNNING state. Attempting to recover...")
+		if err := b.recoverState(); err != nil {
+			b.enterSafeMode(fmt.Sprintf("failed to recover bot state: %v", err))
+			return fmt.Errorf("failed to recover bot state: %v", err)
+		}
+		logger.S().Info("Bot state successfully recovered. Resuming operations.")
+	} else {
+		logger.S().Info("No active state found. Starting a new trading cycle...")
+		if err := b.enterMarketAndSetupGrid(); err != nil {
+			b.enterSafeMode(fmt.Sprintf("failed to initialize grid and position: %v", err))
+			return fmt.Errorf("failed to initialize grid and position: %v", err)
+		}
 	}
 
 	go b.strategyLoop()
@@ -607,10 +653,22 @@ func (b *GridTradingBot) Stop() {
 	b.mutex.Unlock()
 
 	logger.S().Info("Stopping bot...")
-	b.cancelAllActiveOrders()
-	if b.wsConn != nil {
+
+	// Give goroutines a moment to stop
+	time.Sleep(500 * time.Millisecond)
+
+	if !b.IsBacktest && b.wsConn != nil {
 		b.wsConn.Close()
 	}
+
+	b.cancelAllActiveOrders()
+
+	if err := b.saveState("STOPPED"); err != nil {
+		logger.S().Errorf("Failed to save stopped state to DB: %v", err)
+	} else {
+		logger.S().Info("Successfully saved 'STOPPED' state to database.")
+	}
+
 	logger.S().Info("Bot stopped.")
 }
 
@@ -641,51 +699,136 @@ func (b *GridTradingBot) monitorStatus() {
 }
 
 // SaveState saves the bot's state to a file
-func (b *GridTradingBot) SaveState(path string) error {
+// --- New State Management Functions ---
+
+// saveState persists the current bot state to the database.
+func (b *GridTradingBot) saveState(status string) error {
 	b.mutex.RLock()
 	defer b.mutex.RUnlock()
 
-	state := models.GridState{
-		GridLevels:     b.gridLevels,
-		EntryPrice:     b.entryPrice,
-		ReversionPrice: b.reversionPrice,
-		ConceptualGrid: b.conceptualGrid,
+	if b.IsBacktest {
+		return nil // Do not save state in backtest mode
+	}
+	if b.botState == nil {
+		return errors.New("cannot save nil bot state")
 	}
 
-	data, err := json.MarshalIndent(state, "", "  ")
+	// Create a snapshot of the conceptual grid
+	conceptualGridJSON, err := json.Marshal(b.conceptualGrid)
 	if err != nil {
-		return fmt.Errorf("could not serialize bot state: %v", err)
+		return fmt.Errorf("failed to marshal conceptual grid: %v", err)
 	}
 
-	return ioutil.WriteFile(path, data, 0644)
+	// Update the existing botState object with the latest data
+	b.botState.Status = status
+	b.botState.EntryPrice = b.entryPrice
+	b.botState.ReversionPrice = b.reversionPrice
+	// Note: The DB schema expects GridLevels and ConceptualGrid as JSON strings.
+	// This part is inconsistent with the recovery logic and might need a fix later.
+	// For now, we save the conceptual grid and an empty grid level array.
+	b.botState.GridLevels = "[]" // Placeholder, as gridLevels is dynamic
+	b.botState.ConceptualGrid = string(conceptualGridJSON)
+	b.botState.BasePositionSnapshot = b.basePositionEstablished
+	b.botState.LastUpdateTime = time.Now()
+
+	if err := b.exchange.SaveState(b.botState); err != nil {
+		return fmt.Errorf("failed to save bot state via exchange: %v", err)
+	}
+
+	logger.S().Infof("Successfully saved bot state for cycle %d with status: %s", b.botState.CurrentCycleID, status)
+	return nil
 }
 
-// LoadState loads the bot's state from a file
-func (b *GridTradingBot) LoadState(path string) error {
-	data, err := ioutil.ReadFile(path)
+// loadState loads the bot state from the database.
+func (b *GridTradingBot) loadState() error {
+	if b.IsBacktest {
+		b.botState = nil
+		return nil
+	}
+	state, err := b.exchange.LoadState()
 	if err != nil {
-		if os.IsNotExist(err) {
-			logger.S().Info("State file not found, starting from initial state.")
-			return nil
-		}
-		return fmt.Errorf("could not read state file: %v", err)
+		return fmt.Errorf("failed to load bot state from exchange: %v", err)
 	}
 
-	var state models.GridState
-	if err := json.Unmarshal(data, &state); err != nil {
-		return fmt.Errorf("could not deserialize bot state: %v", err)
+	if state == nil {
+		logger.S().Info("No previous bot state found. Starting fresh.")
+		b.botState = nil // Explicitly set to nil when no state is found
+		return nil
 	}
 
+	b.botState = state
+	logger.S().Infof("Successfully loaded bot state for cycle %d from %s", state.CurrentCycleID, state.LastUpdateTime.Format(time.RFC3339))
+	return nil
+}
+
+// clearState removes the state from the database.
+func (b *GridTradingBot) clearState() error {
+	if b.IsBacktest {
+		return nil
+	}
+	logger.S().Info("Clearing bot state from database.")
+	b.botState = nil
+	return b.exchange.ClearState()
+}
+
+// recoverState uses the loaded DB state to bring the bot back to life.
+func (b *GridTradingBot) recoverState() error {
+	logger.S().Info("--- Recovering Bot State ---")
 	b.mutex.Lock()
-	b.gridLevels = state.GridLevels
+	defer b.mutex.Unlock()
+
+	state := b.botState
 	b.entryPrice = state.EntryPrice
 	b.reversionPrice = state.ReversionPrice
-	b.conceptualGrid = state.ConceptualGrid
-	b.basePositionEstablished = true
-	b.mutex.Unlock()
+	b.basePositionEstablished = state.BasePositionSnapshot
 
-	logger.S().Infof("Successfully loaded bot state from %s.", path)
-	return b.syncWithExchange()
+	if err := json.Unmarshal([]byte(state.ConceptualGrid), &b.conceptualGrid); err != nil {
+		return fmt.Errorf("failed to unmarshal conceptual grid from DB: %w", err)
+	}
+
+	logger.S().Infof("State loaded: EntryPrice=%.4f, ReversionPrice=%.4f", b.entryPrice, b.reversionPrice)
+
+	// Now, reconcile the theoretical grid with actual open orders from the exchange
+	logger.S().Info("Reconciling conceptual grid with actual open orders...")
+	openOrders, err := b.exchange.GetOpenOrders(b.config.Symbol)
+	if err != nil {
+		return fmt.Errorf("could not get open orders during recovery: %v", err)
+	}
+
+	// Create a map for quick lookup of open orders by price
+	openOrderMap := make(map[string]models.Order)
+	for _, order := range openOrders {
+		openOrderMap[order.Price] = order
+	}
+
+	// Rebuild the active gridLevels based on what's actually on the exchange
+	b.gridLevels = make([]models.GridLevel, 0)
+	var tickSize string
+	for _, f := range b.symbolInfo.Filters {
+		if f.FilterType == "PRICE_FILTER" {
+			tickSize = f.TickSize
+		}
+	}
+
+	for i, price := range b.conceptualGrid {
+		adjustedPrice := adjustValueToStep(price, tickSize)
+		priceStr := strconv.FormatFloat(adjustedPrice, 'f', -1, 64)
+		if order, exists := openOrderMap[priceStr]; exists {
+			qty, _ := strconv.ParseFloat(order.OrigQty, 64)
+			level := models.GridLevel{
+				Price:    adjustedPrice,
+				Quantity: qty,
+				Side:     order.Side,
+				IsActive: true,
+				OrderID:  order.OrderId,
+				GridID:   i,
+			}
+			b.gridLevels = append(b.gridLevels, level)
+		}
+	}
+
+	logger.S().Infof("Recovery complete. Reconstructed %d active grid levels from open orders.", len(b.gridLevels))
+	return nil
 }
 
 // printStatus prints the current status of the bot
@@ -821,7 +964,7 @@ func (b *GridTradingBot) syncWithExchange() error {
 			logger.S().Infof("Successfully matched and restored order: ID %d, GridID %d", remoteOrder.OrderId, matchedGridID)
 		} else {
 			logger.S().Warnf("Found an unrecognized order: ID %d, Price %.4f. Cancelling it...", remoteOrder.OrderId, price)
-			if err := b.exchange.CancelOrder(b.config.Symbol, remoteOrder.OrderId); err != nil {
+			if _, err := b.exchange.CancelOrder(b.config.Symbol, remoteOrder.OrderId, remoteOrder.ClientOrderId); err != nil {
 				logger.S().Errorf("Failed to cancel unrecognized order %d: %v", remoteOrder.OrderId, err)
 			}
 		}
@@ -837,7 +980,7 @@ func (b *GridTradingBot) handleWebSocketMessage(message []byte) {
 		logger.S().Warnf("Could not unmarshal WebSocket message into map: %v, Raw: %s", err, string(message))
 		return
 	}
-
+	logger.S().Debugf("Received WebSocket message: %s", string(message))
 	eventType, ok := data["e"].(string)
 	if !ok {
 		logger.S().Debugf("Received event with non-string or missing event type: %s", string(message))
@@ -871,6 +1014,16 @@ func (b *GridTradingBot) handleWebSocketMessage(message []byte) {
 // handleOrderUpdate is now called sequentially by the event processor.
 // It no longer needs to manage its own concurrency with goroutines or the isRebuilding flag.
 func (b *GridTradingBot) handleOrderUpdate(event models.OrderUpdateEvent) {
+	b.mutex.RLock()
+	initialOrderID := b.initialMarketOrderID
+	b.mutex.RUnlock()
+
+	// This is the new logic to ignore the initial market order fill event from WebSocket
+	if initialOrderID != 0 && event.Order.OrderID == initialOrderID {
+		logger.S().Debugf("Ignoring WebSocket fill event for initial market order %d, as it's handled by polling.", event.Order.OrderID)
+		return
+	}
+
 	if event.Order.ExecutionType != "TRADE" || event.Order.Status != "FILLED" {
 		return
 	}
@@ -907,6 +1060,13 @@ func (b *GridTradingBot) handleOrderUpdate(event models.OrderUpdateEvent) {
 			} else {
 				logger.S().Infof("Price %.4f has reached or exceeded reversion price %.4f. Triggering cycle restart.", filledPrice, reversionPrice)
 			}
+
+			// Clear state before signaling a restart
+			if err := b.clearState(); err != nil {
+				b.enterSafeMode(fmt.Sprintf("CRITICAL: Failed to clear bot state after cycle completion: %v", err))
+				return
+			}
+
 			// Use a non-blocking send in case the strategy loop is not ready
 			select {
 			case b.reentrySignal <- true:

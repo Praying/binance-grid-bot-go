@@ -8,6 +8,7 @@ import (
 // Config 结构体定义了机器人的所有配置参数
 type Config struct {
 	IsTestnet                bool      `json:"is_testnet"` // 是否使用测试网
+	DBPath                   string    `json:"db_path"`    // 新增：数据库文件路径
 	LiveAPIURL               string    `json:"live_api_url"`
 	LiveWSURL                string    `json:"live_ws_url"`
 	TestnetAPIURL            string    `json:"testnet_api_url"`
@@ -236,16 +237,17 @@ type ExecutionReport struct {
 	TradeID       int64  `json:"t"`  // Trade ID
 }
 
-// BotState 定义了需要保存和加载的机器人状态
+// BotState represents the persisted state of the trading bot's current cycle.
 type BotState struct {
-	GridLevels              []GridLevel `json:"grid_levels"`
-	BasePositionEstablished bool        `json:"base_position_established"`
-	ConceptualGrid          []float64   `json:"conceptual_grid"`
-	EntryPrice              float64     `json:"entry_price"`
-	ReversionPrice          float64     `json:"reversion_price"`
-	IsReentering            bool        `json:"is_reentering"`
-	CurrentPrice            float64     `json:"current_price"`
-	CurrentTime             time.Time   `json:"current_time"`
+	ID                   int       `json:"id"`
+	CurrentCycleID       int64     `json:"current_cycle_id"`
+	Status               string    `json:"status"`
+	EntryPrice           float64   `json:"entry_price"`
+	ReversionPrice       float64   `json:"reversion_price"`
+	GridLevels           string    `json:"grid_levels"`
+	ConceptualGrid       string    `json:"conceptual_grid"`
+	BasePositionSnapshot bool      `json:"base_position_snapshot"`
+	LastUpdateTime       time.Time `json:"last_update_time"`
 }
 
 // Balance 定义了账户中特定资产的余额信息
@@ -265,14 +267,6 @@ type Error struct {
 // Error 方法使得 BinanceError 实现了 error 接口
 func (e *Error) Error() string {
 	return fmt.Sprintf("API Error: code=%d, msg=%s", e.Code, e.Msg)
-}
-
-// GridState 定义了需要持久化保存的机器人状态
-type GridState struct {
-	GridLevels     []GridLevel `json:"grid_levels"`
-	EntryPrice     float64     `json:"entry_price"`
-	ReversionPrice float64     `json:"reversion_price"`
-	ConceptualGrid []float64   `json:"conceptual_grid"`
 }
 
 // OrderUpdateEvent 是从用户数据流接收到的订单更新事件的完整结构

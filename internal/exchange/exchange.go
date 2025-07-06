@@ -23,7 +23,7 @@ type Exchange interface {
 	GetPrice(symbol string) (float64, error)
 	GetPositions(symbol string) ([]models.Position, error)
 	PlaceOrder(symbol, side, orderType string, quantity, price float64, clientOrderID string) (*models.Order, error)
-	CancelOrder(symbol string, orderID int64) error
+	CancelOrder(symbol string, orderID int64, clientOrderID string) (*models.Order, error)
 	SetLeverage(symbol string, leverage int) error
 	SetPositionMode(isHedgeMode bool) error
 	GetPositionMode() (bool, error)
@@ -31,7 +31,7 @@ type Exchange interface {
 	GetMarginType(symbol string) (string, error)
 	GetAccountInfo() (*models.AccountInfo, error)
 	CancelAllOpenOrders(symbol string) error
-	GetOrderStatus(symbol string, orderID int64) (*models.Order, error)
+	GetOrderStatus(symbol string, orderID int64, clientOrderID string) (*models.Order, error)
 	GetCurrentTime() time.Time
 	// GetAccountState 获取账户状态，包括总持仓价值和账户总权益
 	GetAccountState(symbol string) (positionValue float64, accountEquity float64, err error)
@@ -44,4 +44,9 @@ type Exchange interface {
 	KeepAliveListenKey(listenKey string) error
 	GetBalance() (float64, error)
 	ConnectWebSocket(listenKey string) (*websocket.Conn, error)
+	// State persistence methods
+	SaveState(state *models.BotState) error
+	LoadState() (*models.BotState, error)
+	ClearState() error
+	GetNextCycleID() (int64, error)
 }

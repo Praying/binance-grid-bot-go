@@ -8,6 +8,7 @@ import (
 	"binance-grid-bot-go/internal/logger" // 新增 logger 包
 	"binance-grid-bot-go/internal/models"
 	"binance-grid-bot-go/internal/reporter"
+	"binance-grid-bot-go/internal/storage"
 	"encoding/csv"
 	"flag"
 	"fmt"
@@ -147,14 +148,26 @@ func runLiveMode(cfg *models.Config) {
 	cfg.BaseURL = baseURL
 	cfg.WSBaseURL = wsBaseURL
 
+	// 初始化数据库
+	db, err := storage.InitDB(cfg.DBPath)
+	if err != nil {
+		logger.S().Fatalf("初始化数据库失败: %v", err)
+	}
+	defer db.Close()
+
 	// 初始化交易所
-	liveExchange, err := exchange.NewLiveExchange(apiKey, secretKey, cfg.BaseURL, cfg.WSBaseURL, logger.L())
+	liveExchange, err := exchange.NewLiveExchange(apiKey, secretKey, cfg.BaseURL, cfg.WSBaseURL, logger.L(), db)
 	if err != nil {
 		logger.S().Fatalf("初始化交易所失败: %v", err)
 	}
 
 	// --- 初始化交易所设置 ---
 	logger.S().Info("正在初始化交易所设置...")
+
+	// --- 执行订单恢复流程 ---
+	if err := liveExchange.Recover(cfg.Symbol); err != nil {
+		logger.S().Fatalf("订单恢复失败: %v", err)
+	}
 
 	// 1. 设置持仓模式 (单向/双向)
 	if _, err := liveExchange.GetAccountInfo(); err != nil {
