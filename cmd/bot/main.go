@@ -7,6 +7,7 @@ import (
 	"binance-grid-bot-go/internal/exchange"
 	"binance-grid-bot-go/internal/logger" // 新增 logger 包
 	"binance-grid-bot-go/internal/models"
+	"binance-grid-bot-go/internal/persistence"
 	"binance-grid-bot-go/internal/reporter"
 	"encoding/csv"
 	"flag"
@@ -71,9 +72,21 @@ func main() {
 	logger.InitLogger(cfg.LogConfig)
 	defer logger.S().Sync() // 确保在main函数退出时刷新所有缓冲的日志
 
+	// --- 初始化持久化仓库 ---
+	// 注意：回测模式不使用持久化仓库
+	var repo persistence.StateRepository
+	if *mode == "live" {
+		var err error
+		repo, err = persistence.NewBadgerRepository(cfg.DBPath)
+		if err != nil {
+			logger.S().Fatalf("初始化持久化仓库失败: %v", err)
+		}
+		defer repo.Close()
+	}
+
 	switch *mode {
 	case "live":
-		runLiveMode(cfg)
+		runLiveMode(cfg, repo)
 	case "backtest":
 		finalDataPath, err := handleBacktestMode(*symbol, *startDate, *endDate, *dataPath)
 		if err != nil {
@@ -122,8 +135,8 @@ func handleBacktestMode(symbol, startDate, endDate, dataPath string) (string, er
 	return dataPath, nil
 }
 
-// runLiveMode 运行实时交易机器人
-func runLiveMode(cfg *models.Config) {
+// 运行实时交易机器人
+func runLiveMode(cfg *models.Config, repo persistence.StateRepository) {
 	logger.S().Info("--- 启动实时交易模式 ---")
 
 	// 从环境变量加载API密钥
@@ -200,7 +213,7 @@ func runLiveMode(cfg *models.Config) {
 	}
 
 	// 初始化机器人
-	gridBot := bot.NewGridTradingBot(cfg, liveExchange, false)
+	gridBot := bot.NewGridTradingBot(cfg, liveExchange, repo, false, logger.L())
 
 	// 启动机器人
 	if err := gridBot.Start(); err != nil {
@@ -232,7 +245,7 @@ func runBacktestMode(cfg *models.Config, dataPath string) {
 
 	// 使用新的构造函数，并传入完整的 config
 	backtestExchange := exchange.NewBacktestExchange(cfg)
-	gridBot := bot.NewGridTradingBot(cfg, backtestExchange, true)
+	gridBot := bot.NewGridTradingBot(cfg, backtestExchange, nil, true, logger.L())
 
 	// 加载并处理历史数据
 	file, err := os.Open(dataPath)

@@ -44,4 +44,5 @@ type Exchange interface {
 	KeepAliveListenKey(listenKey string) error
 	GetBalance() (float64, error)
 	ConnectWebSocket(listenKey string) (*websocket.Conn, error)
+	GetOrderHistory(symbol string, clientOrderID string) (*models.Order, error)
 }

@@ -370,6 +370,30 @@ func (e *LiveExchange) GetOrderStatus(symbol string, orderID int64) (*models.Ord
 	return &order, nil
 }
 
+// GetOrderHistory 使用 clientOrderID 查询订单的最终状态。
+// 这对于在重启后恢复那些在交易所的当前挂单列表中找不到的订单特别有用。
+func (e *LiveExchange) GetOrderHistory(symbol string, clientOrderID string) (*models.Order, error) {
+	params := url.Values{}
+	params.Set("symbol", symbol)
+	params.Set("origClientOrderId", clientOrderID)
+
+	data, err := e.doRequest("GET", "/fapi/v1/order", params, true)
+	if err != nil {
+		// 如果错误是币安的特定错误，例如 "Order does not exist" (-2013)，
+		// 我们将其包装成一个更明确的错误类型，以便上层逻辑可以据此作出判断。
+		if binanceErr, ok := err.(*models.Error); ok && binanceErr.Code == -2013 {
+			return nil, fmt.Errorf("订单 %s 在交易所历史上不存在: %w", clientOrderID, err)
+		}
+		return nil, fmt.Errorf("查询订单历史失败: %w", err)
+	}
+
+	var order models.Order
+	if err := json.Unmarshal(data, &order); err != nil {
+		return nil, fmt.Errorf("解析订单历史响应失败: %w", err)
+	}
+	return &order, nil
+}
+
 // GetCurrentTime 返回当前时间。在真实交易中，我们直接返回系统时间。
 func (e *LiveExchange) GetCurrentTime() time.Time {
 	return time.Now()

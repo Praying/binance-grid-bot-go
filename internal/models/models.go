@@ -41,6 +41,7 @@ type Config struct {
 
 	BaseURL   string `json:"base_url"`    // REST API基础地址 (将由程序动态设置)
 	WSBaseURL string `json:"ws_base_url"` // WebSocket基础地址 (将由程序动态设置)
+	DBPath    string `json:"db_path"`     // 新增: 持久化数据库路径
 }
 
 // LogConfig 定义了日志相关的配置
@@ -116,18 +117,6 @@ type Order struct {
 	ReduceOnly    bool   `json:"reduceOnly"`
 	ClosePosition bool   `json:"closePosition"`
 	PriceProtect  bool   `json:"priceProtect"`
-}
-
-// GridLevel 代表网格中的一个价格档位
-type GridLevel struct {
-	Price           float64 `json:"price"`
-	Quantity        float64 `json:"quantity"`
-	Side            string  `json:"side"`
-	IsActive        bool    `json:"is_active"`
-	OrderID         int64   `json:"order_id"`
-	GridID          int     `json:"grid_id"`                     // 新增：记录该订单关联的理论网格ID (conceptualGrid的索引)
-	PairID          int     `json:"pair_id"`                     // 用于配对买单和卖单
-	PairedSellPrice float64 `json:"paired_sell_price,omitempty"` // 仅在买单中使用，记录其对应的卖出价
 }
 
 // CompletedTrade 记录一笔完成的交易（买入和卖出）
@@ -236,18 +225,6 @@ type ExecutionReport struct {
 	TradeID       int64  `json:"t"`  // Trade ID
 }
 
-// BotState 定义了需要保存和加载的机器人状态
-type BotState struct {
-	GridLevels              []GridLevel `json:"grid_levels"`
-	BasePositionEstablished bool        `json:"base_position_established"`
-	ConceptualGrid          []float64   `json:"conceptual_grid"`
-	EntryPrice              float64     `json:"entry_price"`
-	ReversionPrice          float64     `json:"reversion_price"`
-	IsReentering            bool        `json:"is_reentering"`
-	CurrentPrice            float64     `json:"current_price"`
-	CurrentTime             time.Time   `json:"current_time"`
-}
-
 // Balance 定义了账户中特定资产的余额信息
 type Balance struct {
 	Asset              string `json:"asset"`
@@ -265,14 +242,6 @@ type Error struct {
 // Error 方法使得 BinanceError 实现了 error 接口
 func (e *Error) Error() string {
 	return fmt.Sprintf("API Error: code=%d, msg=%s", e.Code, e.Msg)
-}
-
-// GridState 定义了需要持久化保存的机器人状态
-type GridState struct {
-	GridLevels     []GridLevel `json:"grid_levels"`
-	EntryPrice     float64     `json:"entry_price"`
-	ReversionPrice float64     `json:"reversion_price"`
-	ConceptualGrid []float64   `json:"conceptual_grid"`
 }
 
 // OrderUpdateEvent 是从用户数据流接收到的订单更新事件的完整结构

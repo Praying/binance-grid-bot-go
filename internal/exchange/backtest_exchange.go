@@ -422,6 +422,39 @@ func (e *BacktestExchange) GetOrderStatus(symbol string, orderID int64) (*models
 	return nil, fmt.Errorf("订单 ID %d 在回测中未找到", orderID)
 }
 
+// GetOrderHistory 在回测中模拟获取订单历史。
+// 根据任务要求，我们简单地返回一个已成交的订单，以测试恢复逻辑。
+func (e *BacktestExchange) GetOrderHistory(symbol string, clientOrderID string) (*models.Order, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	// 尝试在现有订单中查找
+	for _, order := range e.orders {
+		if order.ClientOrderId == clientOrderID {
+			// 如果找到了，返回一个副本
+			orderCopy := *order
+			// 确保状态是最终状态
+			if orderCopy.Status == "NEW" {
+				orderCopy.Status = "FILLED" // 模拟它已经被成交
+			}
+			return &orderCopy, nil
+		}
+	}
+
+	// 如果在当前订单列表中找不到（这在恢复场景中很常见），
+	// 我们创建一个模拟的已成交订单。
+	return &models.Order{
+		Symbol:        symbol,
+		ClientOrderId: clientOrderID,
+		Status:        "FILLED",
+		Type:          "LIMIT", // 假设是限价单
+		Side:          "BUY",   // 假设是买单
+		Price:         "1.0",   // 模拟价格
+		OrigQty:       "1.0",   // 模拟数量
+		ExecutedQty:   "1.0",   // 模拟已执行数量
+	}, nil
+}
+
 func (e *BacktestExchange) CancelAllOpenOrders(symbol string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()

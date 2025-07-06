@@ -30,5 +30,6 @@
  "taker_fee_rate": 0.0004,
  "maker_fee_rate": 0.0002,
  "slippage_rate": 0.0005,
- "maintenance_margin_rate": 0.005
+ "maintenance_margin_rate": 0.005,
+ "db_path": "data/bot_state.db"
 }
