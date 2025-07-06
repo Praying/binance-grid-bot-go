@@ -8,6 +8,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 )
 
 // mockStateRepository is a mock implementation of the StateRepository interface for testing.
@@ -78,13 +79,21 @@ func (m *mockStateRepository) wasSaveCalled() bool {
 	return m.saveCalled
 }
 
+// mockOrderPlacer is a mock implementation of the OrderPlacer interface.
+type mockOrderPlacer struct{}
+
+func (m *mockOrderPlacer) PlaceNewOrder(level models.GridLevelDefinition) {
+	// Mock implementation, does nothing.
+}
+
 // TestNewStateManager verifies that the StateManager is initialized correctly.
 func TestNewStateManager(t *testing.T) {
 	initialState := &models.BotState{BotID: "test-bot"}
 	repo := newMockStateRepository()
-	rebuildChan := make(chan models.GridLevelDefinition)
+	orderPlacer := &mockOrderPlacer{}
+	logger := zap.NewNop()
 
-	sm := NewStateManager(initialState, repo, rebuildChan)
+	sm := NewStateManager(initialState, repo, orderPlacer, logger)
 	require.NotNil(t, sm, "StateManager should not be nil")
 
 	// Check if the initial state is set correctly
@@ -96,16 +105,16 @@ func TestNewStateManager(t *testing.T) {
 	assert.NotNil(t, sm.eventChannel, "eventChannel should be created")
 	assert.NotNil(t, sm.persistenceChan, "persistenceChan should be created")
 	assert.NotNil(t, sm.stopChan, "stopChan should be created")
-	assert.NotNil(t, sm.rebuildGridChan, "rebuildGridChan should be set")
 }
 
 // TestStateResetEvent tests the handling of a StateResetEvent.
 func TestStateResetEvent(t *testing.T) {
 	initialState := &models.BotState{BotID: "initial-bot"}
 	repo := newMockStateRepository()
-	rebuildChan := make(chan models.GridLevelDefinition, 1)
+	orderPlacer := &mockOrderPlacer{}
+	logger := zap.NewNop()
 
-	sm := NewStateManager(initialState, repo, rebuildChan)
+	sm := NewStateManager(initialState, repo, orderPlacer, logger)
 	sm.Start()
 	defer sm.Stop()
 
@@ -156,9 +165,10 @@ func TestUpdateGridLevelEvent(t *testing.T) {
 		},
 	}
 	repo := newMockStateRepository()
-	rebuildChan := make(chan models.GridLevelDefinition, 1)
+	orderPlacer := &mockOrderPlacer{}
+	logger := zap.NewNop()
 
-	sm := NewStateManager(initialState, repo, rebuildChan)
+	sm := NewStateManager(initialState, repo, orderPlacer, logger)
 	sm.Start()
 	defer sm.Stop()
 
@@ -207,16 +217,18 @@ func TestUpdateGridLevelEvent(t *testing.T) {
 func TestAsyncPersistence(t *testing.T) {
 	initialState := &models.BotState{BotID: "async-test"}
 	repo := newMockStateRepository()
-	rebuildChan := make(chan models.GridLevelDefinition, 1)
+	orderPlacer := &mockOrderPlacer{}
+	logger := zap.NewNop()
 
-	sm := NewStateManager(initialState, repo, rebuildChan)
+	sm := NewStateManager(initialState, repo, orderPlacer, logger)
 	sm.Start()
 	defer sm.Stop()
 
 	// Dispatch an event that will trigger persistence
 	sm.DispatchEvent(NormalizedEvent{
-		Type: StateResetEvent,
-		Data: &models.BotState{BotID: "new-state"},
+		Type:      StateResetEvent,
+		Timestamp: time.Now(),
+		Data:      &models.BotState{BotID: "new-state"},
 	})
 
 	// --- Verification Point 1: Check that Save is NOT called synchronously ---
