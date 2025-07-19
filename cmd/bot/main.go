@@ -213,7 +213,7 @@ func runLiveMode(cfg *models.Config) {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 
-	// 停止机器人, 状态保存逻辑已移至 bot.Stop() 内部
+	// 停止机器人
 	gridBot.Stop()
 	logger.S().Info("机器人已成功停止。")
 }
@@ -277,11 +277,16 @@ func runBacktestMode(cfg *models.Config, dataPath string) {
 	}
 
 	backtestExchange.SetPrice(initialOpen, initialHigh, initialLow, initialClose, initialTime)
-	gridBot.SetCurrentPrice(initialClose)
+	// gridBot.SetCurrentPrice is now handled internally by the backtest exchange mock
 	if err := gridBot.StartForBacktest(); err != nil {
 		logger.S().Fatalf("回测机器人初始化失败: %v", err)
 	}
 	logger.S().Infof("使用初始价格 %.2f 完成机器人初始化。\n", initialClose)
+
+	// 在开始推送价格数据之前，给予机器人足够的时间来完成其内部的、基于ticker的初始化检查。
+	// 这是一个简单的、用于打破死锁的同步点。
+	logger.S().Info("等待机器人完成内部初始化...")
+	time.Sleep(2 * time.Second)
 
 	// --- 循环处理所有数据点 ---
 	logger.S().Info("开始回测...")
@@ -307,7 +312,7 @@ func runBacktestMode(cfg *models.Config, dataPath string) {
 		}
 		timestamp := time.UnixMilli(timestampMs)
 		backtestExchange.SetPrice(openPrice, high, low, closePrice, timestamp)
-		gridBot.ProcessBacktestTick()
+		// gridBot.ProcessBacktestTick() is now handled by the backtest exchange mock pushing events
 	}
 
 	logger.S().Info("回测结束。")

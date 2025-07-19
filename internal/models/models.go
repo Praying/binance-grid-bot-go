@@ -1,9 +1,12 @@
 package models
 
 import (
+	"errors"
 	"fmt"
 	"time"
 )
+
+var ErrStateNotFound = errors.New("state not found in database")
 
 // Config 结构体定义了机器人的所有配置参数
 type Config struct {
@@ -118,16 +121,66 @@ type Order struct {
 	PriceProtect  bool   `json:"priceProtect"`
 }
 
-// GridLevel 代表网格中的一个价格档位
-type GridLevel struct {
-	Price           float64 `json:"price"`
-	Quantity        float64 `json:"quantity"`
-	Side            string  `json:"side"`
-	IsActive        bool    `json:"is_active"`
-	OrderID         int64   `json:"order_id"`
-	GridID          int     `json:"grid_id"`                     // 新增：记录该订单关联的理论网格ID (conceptualGrid的索引)
-	PairID          int     `json:"pair_id"`                     // 用于配对买单和卖单
-	PairedSellPrice float64 `json:"paired_sell_price,omitempty"` // 仅在买单中使用，记录其对应的卖出价
+// --- Core Grid Algorithm Data Structures ---
+
+// GridLevelState 定义了网格水平所有可能的状态
+type GridLevelState string
+
+const (
+	StateIdle       GridLevelState = "Idle"       // 空闲，可随时下单
+	StatePlacing    GridLevelState = "Placing"    // 下单中，等待交易所确认
+	StateActive     GridLevelState = "Active"     // 已挂单，在市场中生效
+	StateFilled     GridLevelState = "Filled"     // 订单完全成交
+	StateCancelling GridLevelState = "Cancelling" // 取消中，等待交易所确认
+	StateCancelled  GridLevelState = "Cancelled"  // 订单已取消
+	StateError      GridLevelState = "Error"      // 出现错误，需人工干预
+)
+
+// OrderSide 定义了订单的方向
+type OrderSide string
+
+const (
+	Buy  OrderSide = "BUY"
+	Sell OrderSide = "SELL"
+)
+
+// Level 代表一个网格价格水平的完整状态。
+// 这是系统的核心原子单元。
+type Level struct {
+	GridID int            `json:"grid_id"` // 在理论网格中的唯一索引
+	Price  float64        `json:"price"`   // 该水平的价格
+	State  GridLevelState `json:"state"`   // **核心状态机字段**
+	Side   OrderSide      `json:"side"`    // 挂单方向 (Buy or Sell)
+
+	// --- 订单关联与恢复的关键字段 ---
+	OrderID       int64  `json:"order_id"`        // 交易所生成的订单ID (下单成功后填充)
+	ClientOrderID string `json:"client_order_id"` // **本地生成的唯一ID，用于防重和恢复**
+
+	// --- 幂等性控制 ---
+	LastTradeID string `json:"last_trade_id"` // **最后处理的成交事件ID，防止重复处理**
+
+	// --- 统计与审计 ---
+	FilledQuantity float64 `json:"filled_quantity"` // 累计成交数量
+	UpdatedAt      int64   `json:"updated_at"`      // 状态最后更新时间戳
+}
+
+// Grid 是算法模块的核心状态机。
+type Grid struct {
+	Config         *Config `json:"-"`               // 忽略在JSON中的序列化
+	ConceptualGrid []Level `json:"conceptual_grid"` // 理论上的完整网格（包含所有价格水平）
+	LastPrice      float64 `json:"last_price"`      // 最新成交价
+	EntryPrice     float64 `json:"entry_price"`
+	ReversionPrice float64 `json:"reversion_price"`
+}
+
+// BotState 定义了需要持久化保存的机器人完整状态
+type BotState struct {
+	CurrentCycleID string  `json:"current_cycle_id"` // 当前交易周期的唯一标识 (UUID)
+	Status         string  `json:"status"`           // 机器人的高级状态 (e.g., "RUNNING", "STOPPED")
+	EntryPrice     float64 `json:"entry_price"`      // 当前周期的初始入场价格
+	ReversionPrice float64 `json:"reversion_price"`  // 当前周期的目标回归价格
+	GridLevelsJSON string  `json:"grid_levels_json"` // 所有 Level 的状态数组，以 JSON 字符串形式存储
+	LastUpdated    string  `json:"last_updated"`     // 状态最后更新时间
 }
 
 // CompletedTrade 记录一笔完成的交易（买入和卖出）
@@ -236,18 +289,6 @@ type ExecutionReport struct {
 	TradeID       int64  `json:"t"`  // Trade ID
 }
 
-// BotState 定义了需要保存和加载的机器人状态
-type BotState struct {
-	GridLevels              []GridLevel `json:"grid_levels"`
-	BasePositionEstablished bool        `json:"base_position_established"`
-	ConceptualGrid          []float64   `json:"conceptual_grid"`
-	EntryPrice              float64     `json:"entry_price"`
-	ReversionPrice          float64     `json:"reversion_price"`
-	IsReentering            bool        `json:"is_reentering"`
-	CurrentPrice            float64     `json:"current_price"`
-	CurrentTime             time.Time   `json:"current_time"`
-}
-
 // Balance 定义了账户中特定资产的余额信息
 type Balance struct {
 	Asset              string `json:"asset"`
@@ -265,14 +306,6 @@ type Error struct {
 // Error 方法使得 BinanceError 实现了 error 接口
 func (e *Error) Error() string {
 	return fmt.Sprintf("API Error: code=%d, msg=%s", e.Code, e.Msg)
-}
-
-// GridState 定义了需要持久化保存的机器人状态
-type GridState struct {
-	GridLevels     []GridLevel `json:"grid_levels"`
-	EntryPrice     float64     `json:"entry_price"`
-	ReversionPrice float64     `json:"reversion_price"`
-	ConceptualGrid []float64   `json:"conceptual_grid"`
 }
 
 // OrderUpdateEvent 是从用户数据流接收到的订单更新事件的完整结构

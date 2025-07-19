@@ -1,83 +1,55 @@
 package idgenerator
 
 import (
+	"binance-grid-bot-go/internal/storage"
 	"errors"
-	"strconv"
-	"sync"
+	"fmt"
+	"sync/atomic"
 	"time"
-
-	"github.com/jxskiss/base62"
 )
 
-const (
-	instanceIDBits  uint64 = 10
-	sequenceBits    uint64 = 12
-	maxInstanceID   int64  = -1 ^ (-1 << instanceIDBits)
-	maxSequence     int64  = -1 ^ (-1 << sequenceBits)
-	timestampShift         = instanceIDBits + sequenceBits
-	instanceIDShift        = sequenceBits
-)
-
-// customEpoch is the custom epoch start time (2024-01-01 00:00:00 UTC) in milliseconds.
-var customEpoch int64 = 1704067200000
-
-// IDGenerator is a distributed unique ID generator inspired by Twitter's Snowflake.
+// IDGenerator is a persistent, sequential ID generator.
 type IDGenerator struct {
-	mu            sync.Mutex
-	lastTimestamp int64
-	instanceID    int64
-	sequence      int64
+	lastID  atomic.Uint64
+	storage storage.Storage
 }
 
-// NewIDGenerator creates a new IDGenerator.
-// The instanceID must be unique for each running instance of the service.
-func NewIDGenerator(instanceID int64) (*IDGenerator, error) {
-	if instanceID < 0 || instanceID > maxInstanceID {
-		return nil, errors.New("instance ID out of range")
+// NewIDGenerator creates a new persistent IDGenerator.
+// It loads the last known ID from the provided storage.
+func NewIDGenerator(storage storage.Storage) (*IDGenerator, error) {
+	if storage == nil {
+		return nil, errors.New("storage cannot be nil")
 	}
-	return &IDGenerator{instanceID: instanceID}, nil
+
+	lastID, err := storage.LoadIDGeneratorState()
+	if err != nil {
+		return nil, fmt.Errorf("failed to load id generator state: %w", err)
+	}
+
+	gen := &IDGenerator{
+		storage: storage,
+	}
+	gen.lastID.Store(lastID)
+
+	return gen, nil
 }
 
-// Generate creates and returns a new unique ID.
-// The returned ID is a Base62 encoded string, which is URL-safe and compact.
+// Generate creates and returns a new unique, persistent ID.
+// The format is "grid-timestamp-sequence".
 func (g *IDGenerator) Generate() (string, error) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
+	// Atomically increment the ID.
+	newID := g.lastID.Add(1)
 
-	currentTimestamp := time.Now().UnixMilli() - customEpoch
-
-	if currentTimestamp < g.lastTimestamp {
-		// Clock moved backwards. This is a serious problem.
-		// In a real-world high-concurrency system, this might require coordination.
-		// For now, we return an error to prevent generating non-monotonic IDs.
-		return "", errors.New("clock moved backwards, refusing to generate ID")
+	// Persist the new ID to storage.
+	if err := g.storage.SaveIDGeneratorState(newID); err != nil {
+		// This is a critical failure. If we can't save the state, we risk reusing IDs on restart.
+		// A real-world system might enter a safe mode here.
+		// For now, we'll return the ID but also the error to signal the problem.
+		return "", fmt.Errorf("generated new ID (%d) but failed to persist state: %w", newID, err)
 	}
 
-	if currentTimestamp == g.lastTimestamp {
-		g.sequence = (g.sequence + 1) & maxSequence
-		if g.sequence == 0 {
-			// Sequence overflow, spin-wait for the next millisecond.
-			for currentTimestamp <= g.lastTimestamp {
-				currentTimestamp = time.Now().UnixMilli() - customEpoch
-			}
-		}
-	} else {
-		// New millisecond, reset sequence.
-		g.sequence = 0
-	}
-
-	g.lastTimestamp = currentTimestamp
-
-	id := (currentTimestamp << timestampShift) |
-		(g.instanceID << instanceIDShift) |
-		g.sequence
-
-	// Encode the 64-bit integer to a Base62 string.
-	// We convert the int64 to a byte slice for the encoder.
-	// Note: A more direct int64-to-base62 would be more efficient, but this is clear and works.
-	// A simple string conversion is sufficient here.
-	idStr := strconv.FormatInt(id, 10)
-	encodedID := base62.EncodeToString([]byte(idStr))
-
-	return encodedID, nil
+	// Format the ID with a timestamp for better uniqueness and readability.
+	// Example: "grid-1704067200-123"
+	timestamp := time.Now().Unix()
+	return fmt.Sprintf("grid-%d-%d", timestamp, newID), nil
 }

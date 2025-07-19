@@ -26,6 +26,7 @@ type BacktestExchange struct {
 	buyQueue              map[string][]models.BuyTrade // 新增：FIFO买入队列, 替换 positionEntryTime
 	orders                map[int64]*models.Order
 	TradeLog              []models.CompletedTrade
+	tradesByOrderID       map[int64]*models.Trade // New: For fast trade lookup by order ID
 	EquityCurve           []float64
 	dailyEquity           map[string]float64 // 新增：用于记录每日权益
 	NextOrderID           int64
@@ -56,6 +57,7 @@ func NewBacktestExchange(cfg *models.Config) *BacktestExchange {
 		buyQueue:              make(map[string][]models.BuyTrade),
 		orders:                make(map[int64]*models.Order),
 		TradeLog:              make([]models.CompletedTrade, 0),
+		tradesByOrderID:       make(map[int64]*models.Trade),
 		EquityCurve:           make([]float64, 0, 10000),
 		dailyEquity:           make(map[string]float64),
 		NextOrderID:           1,
@@ -252,6 +254,18 @@ func (e *BacktestExchange) handleFilledOrder(order *models.Order) {
 		}
 	}
 
+	// Create and store the trade record for GetLastTrade
+	tradeRecord := &models.Trade{
+		Symbol:  order.Symbol,
+		ID:      order.OrderId, // Use the exchange-generated OrderId as the Trade ID in backtest
+		OrderID: order.OrderId,
+		Side:    order.Side,
+		Price:   strconv.FormatFloat(executionPrice, 'f', -1, 64),
+		Qty:     strconv.FormatFloat(quantity, 'f', -1, 64),
+		Time:    e.CurrentTime.UnixMilli(),
+	}
+	e.tradesByOrderID[order.OrderId] = tradeRecord
+
 	e.updateMarginAndPNL()
 	if e.Positions[order.Symbol] > 1e-9 {
 		e.calculateLiquidationPrice()
@@ -407,6 +421,10 @@ func (e *BacktestExchange) PlaceOrder(symbol, side, orderType string, quantity, 
 	if orderType == "MARKET" {
 		order.Price = fmt.Sprintf("%.8f", e.CurrentPrice)
 		e.handleFilledOrder(order)
+	} else if orderType == "LIMIT" {
+		// 立即用当前价格检查这个新的限价单是否可以被撮合
+		// 这模拟了如果一个限价单的价格优于或等于市价，它会立即成交一部分或全部
+		e.checkLimitOrdersAtPrice(e.CurrentPrice)
 	}
 
 	return order, nil
@@ -554,16 +572,14 @@ func (e *BacktestExchange) GetMaxWalletExposure() float64 {
 func (e *BacktestExchange) GetLastTrade(symbol string, orderID int64) (*models.Trade, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if len(e.TradeLog) > 0 {
-		// 在回测中，我们简单地返回最后一笔交易作为模拟
-		lastTrade := e.TradeLog[len(e.TradeLog)-1]
-		return &models.Trade{
-			Symbol: lastTrade.Symbol,
-			Price:  strconv.FormatFloat(lastTrade.ExitPrice, 'f', -1, 64),
-			Qty:    strconv.FormatFloat(lastTrade.Quantity, 'f', -1, 64),
-		}, nil
+
+	if trade, ok := e.tradesByOrderID[orderID]; ok {
+		// Return a copy to prevent race conditions on the returned object
+		tradeCopy := *trade
+		return &tradeCopy, nil
 	}
-	return nil, fmt.Errorf("回测中没有可用的成交记录")
+
+	return nil, fmt.Errorf("回测中没有找到订单ID %d 对应的成交记录", orderID)
 }
 
 func (e *BacktestExchange) CancelOrder(symbol string, orderID int64) error {
