@@ -42,6 +42,7 @@ type Exchange interface {
 	GetMaxWalletExposure() float64
 	CreateListenKey() (string, error)
 	KeepAliveListenKey(listenKey string) error
+	CloseListenKey(listenKey string) error
 	GetBalance() (float64, error)
 	ConnectWebSocket(listenKey string) (*websocket.Conn, error)
 }

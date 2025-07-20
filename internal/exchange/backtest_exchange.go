@@ -637,3 +637,8 @@ func (e *BacktestExchange) ConnectWebSocket(listenKey string) (*websocket.Conn, 
 	// 回测模式下不建立真实的 WebSocket 连接
 	return nil, nil
 }
+
+// CloseListenKey 在回测中是一个空操作，因为没有真实的 WebSocket 连接。
+func (e *BacktestExchange) CloseListenKey(listenKey string) error {
+	return nil
+}

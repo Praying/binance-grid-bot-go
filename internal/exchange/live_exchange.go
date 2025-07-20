@@ -509,6 +509,26 @@ func (e *LiveExchange) KeepAliveListenKey(listenKey string) error {
 	return nil
 }
 
+// CloseListenKey 关闭一个 listenKey，使其失效。
+func (e *LiveExchange) CloseListenKey(listenKey string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	params := url.Values{}
+	params.Set("listenKey", listenKey)
+	_, err := e.doRequest("DELETE", "/fapi/v1/listenKey", params, true)
+	if err != nil {
+		e.logger.Error("关闭 listenKey 失败", zap.String("listenKey", listenKey), zap.Error(err))
+		return fmt.Errorf("关闭 listenKey %s 失败: %v", listenKey, err)
+	}
+
+	e.logger.Info("成功关闭 listenKey", zap.String("listenKey", listenKey))
+	if e.listenKey == listenKey {
+		e.listenKey = ""
+	}
+	return nil
+}
+
 // GetBalance 获取账户中特定资产的余额
 func (e *LiveExchange) GetBalance() (float64, error) {
 	data, err := e.doRequest("GET", "/fapi/v2/balance", nil, true)

@@ -166,11 +166,12 @@ type Level struct {
 
 // Grid 是算法模块的核心状态机。
 type Grid struct {
-	Config         *Config `json:"-"`               // 忽略在JSON中的序列化
-	ConceptualGrid []Level `json:"conceptual_grid"` // 理论上的完整网格（包含所有价格水平）
-	LastPrice      float64 `json:"last_price"`      // 最新成交价
-	EntryPrice     float64 `json:"entry_price"`
-	ReversionPrice float64 `json:"reversion_price"`
+	Config         *Config   `json:"-"`               // 忽略在JSON中的序列化
+	ConceptualGrid []float64 `json:"conceptual_grid"` // 理论上的完整网格（仅含价格水平）
+	GridLevels     []Level   `json:"grid_levels"`     // 当前在交易所实际挂单的网格水平
+	LastPrice      float64   `json:"last_price"`      // 最新成交价
+	EntryPrice     float64   `json:"entry_price"`
+	ReversionPrice float64   `json:"reversion_price"`
 }
 
 // BotState 定义了需要持久化保存的机器人完整状态

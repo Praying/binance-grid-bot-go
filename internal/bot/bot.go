@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"go.uber.org/zap"
 )
 
 // EventType defines the type of a normalized event
@@ -49,12 +50,14 @@ type GridTradingBot struct {
 	reentrySignal           chan bool
 	mutex                   sync.RWMutex
 	stopChannel             chan bool
+	stopOnce                sync.Once
 	eventChannel            chan NormalizedEvent // The central event queue
 	symbolInfo              *models.SymbolInfo
 	isHalted                bool
 	safeModeReason          string
 	idGenerator             *idgenerator.IDGenerator
 	storage                 storage.Storage
+	logger                  *zap.Logger
 }
 
 // NewGridTradingBot creates a new instance of the grid trading bot
@@ -70,6 +73,7 @@ func NewGridTradingBot(config *models.Config, ex exchange.Exchange, isBacktest b
 		eventChannel:            make(chan NormalizedEvent, 1024), // Buffered channel
 		reentrySignal:           make(chan bool, 1),
 		isHalted:                false,
+		logger:                  logger.L(),
 	}
 
 	symbolInfo, err := ex.GetSymbolInfo(config.Symbol)
@@ -107,13 +111,13 @@ func (b *GridTradingBot) establishBasePositionAndWait(quantity float64) (float64
 	}
 	logger.S().Infof("Submitted initial market buy order ID: %d, Quantity: %.5f. Waiting for fill...", order.OrderId, quantity)
 
-	// 在回测中，市价单被认为是立即成交的。我们直接检查一次状态即可。
-	// 这种简化的逻辑消除了ticker轮询，这是之前死锁的根源。
-	time.Sleep(10 * time.Millisecond) // 短暂休眠，以防万一模拟交易所有微小的延迟。
+	// In backtesting, market orders are assumed to fill instantly. We check status once.
+	// This simplified logic removes the ticker polling that was a source of deadlocks.
+	time.Sleep(10 * time.Millisecond) // Brief sleep just in case of minor simulated exchange latency.
 
 	status, err := b.exchange.GetOrderStatus(b.config.Symbol, order.OrderId)
 	if err != nil {
-		// 在回测中，如果GetOrderStatus找不到订单，我们假设它已经成交并被归档。
+		// In backtesting, if GetOrderStatus can't find the order, we assume it filled and was archived.
 		if b.IsBacktest && strings.Contains(err.Error(), "not found") {
 			logger.S().Infof("Initial order %d status check returned 'not found', assuming filled in backtest mode.", order.OrderId)
 			b.mutex.Lock()
@@ -157,7 +161,8 @@ func (b *GridTradingBot) enterMarketAndSetupGrid() error {
 	b.currentPrice = currentPrice
 	b.grid.EntryPrice = currentPrice
 	b.grid.ReversionPrice = b.grid.EntryPrice * (1 + b.config.ReturnRate)
-	b.grid.ConceptualGrid = make([]models.Level, 0)
+	b.grid.ConceptualGrid = make([]float64, 0)
+	b.grid.GridLevels = make([]models.Level, 0)
 	b.isReentering = false
 	b.mutex.Unlock()
 
@@ -173,7 +178,7 @@ func (b *GridTradingBot) enterMarketAndSetupGrid() error {
 
 	conceptualLevels := make([]float64, 0)
 	price := b.grid.ReversionPrice
-	for price > (b.grid.EntryPrice * 0.5) {
+	for price > (b.grid.EntryPrice * 0.5) { // Define a reasonable floor for the grid
 		adjustedPrice := adjustValueToStep(price, tickSize)
 		if len(conceptualLevels) == 0 || conceptualLevels[len(conceptualLevels)-1] != adjustedPrice {
 			conceptualLevels = append(conceptualLevels, adjustedPrice)
@@ -181,13 +186,7 @@ func (b *GridTradingBot) enterMarketAndSetupGrid() error {
 		price *= 1 - b.config.GridSpacing
 	}
 
-	for i, p := range conceptualLevels {
-		b.grid.ConceptualGrid = append(b.grid.ConceptualGrid, models.Level{
-			GridID: i,
-			Price:  p,
-			State:  models.StateIdle,
-		})
-	}
+	b.grid.ConceptualGrid = conceptualLevels
 	b.mutex.Unlock()
 
 	if len(b.grid.ConceptualGrid) == 0 {
@@ -200,12 +199,11 @@ func (b *GridTradingBot) enterMarketAndSetupGrid() error {
 	logger.S().Infof("Successfully generated conceptual grid with %d levels.", len(b.grid.ConceptualGrid))
 
 	sellGridCount := 0
-	for _, level := range b.grid.ConceptualGrid {
-		if level.Price > b.grid.EntryPrice {
+	for _, price := range b.grid.ConceptualGrid {
+		if price > b.grid.EntryPrice {
 			sellGridCount++
 		}
 	}
-	// buyGridCount := len(b.grid.ConceptualGrid) - sellGridCount // Currently unused
 	singleGridQuantity, err := b.calculateQuantity(b.grid.EntryPrice)
 	if err != nil {
 		return fmt.Errorf("could not determine grid quantity for initial position: %v", err)
@@ -282,7 +280,6 @@ func (b *GridTradingBot) placeNewOrder(side models.OrderSide, price float64, gri
 // It's designed to be called both synchronously and asynchronously (in a goroutine).
 // It ensures atomicity by checking the level's state inside the lock.
 func (b *GridTradingBot) placeAndManageOrder(side models.OrderSide, level *models.Level, wg *sync.WaitGroup) {
-	logger.S().Debugf("[DEBUG] Enter placeAndManageOrder for Level %d, Price %.4f", level.GridID, level.Price)
 	if wg != nil {
 		defer wg.Done()
 	}
@@ -302,15 +299,13 @@ func (b *GridTradingBot) placeAndManageOrder(side models.OrderSide, level *model
 	b.mutex.Unlock() // Unlock before the blocking network call
 
 	order, err := b.placeNewOrder(side, level.Price, level.GridID)
-	logger.S().Debugf("[DEBUG] placeNewOrder returned for Level %d. Error: %v", level.GridID, err)
 
 	b.mutex.Lock() // Re-lock to update the final state
 	defer b.mutex.Unlock()
 
-	// Another check in case state changed while unlocked (e.g. by a manual intervention or a different process)
+	// Another check in case state changed while unlocked
 	if level.State != models.StatePlacing {
 		logger.S().Warnf("State for level %d changed to %s during order placement. Aborting final state update.", level.GridID, level.State)
-		// If the order placement itself didn't fail, we might have an orphaned order that needs to be cancelled.
 		if err == nil {
 			logger.S().Warnf("Cancelling potentially orphaned order %d for level %d", order.OrderId, level.GridID)
 			cancelErr := b.exchange.CancelOrder(b.config.Symbol, order.OrderId)
@@ -504,366 +499,252 @@ func (b *GridTradingBot) webSocketLoop() {
 		case <-pingTicker.C:
 			if err := b.wsConn.WriteMessage(websocket.PingMessage, nil); err != nil {
 				logger.S().Warnf("Failed to send ping: %v", err)
-				// The read error handler will likely catch the disconnection.
+				// Don't necessarily need to reconnect on ping failure,
+				// the read deadline will catch a dead connection.
 			}
 		case <-b.stopChannel:
-			logger.S().Info("WebSocket listener loop stopped.")
+			logger.S().Info("WebSocket listener stopping.")
 			b.wsConn.Close()
 			return
 		}
 	}
 }
 
-// handleWebSocketMessage parses and handles messages from the WebSocket
+// handleWebSocketMessage parses the incoming message and dispatches it to the event channel
 func (b *GridTradingBot) handleWebSocketMessage(message []byte) {
-	var data map[string]interface{}
-	if err := json.Unmarshal(message, &data); err != nil {
-		logger.S().Warnf("Could not unmarshal WebSocket message into map: %v, Raw: %s", err, string(message))
+	var baseEvent struct {
+		EventType string `json:"e"`
+	}
+	if err := json.Unmarshal(message, &baseEvent); err != nil {
+		logger.S().Warnf("Could not unmarshal base event: %v", err)
 		return
 	}
 
-	eventType, ok := data["e"].(string)
-	if !ok {
-		logger.S().Debugf("Received event with non-string or missing event type: %s", string(message))
-		return
-	}
-
-	switch eventType {
-	case "ORDER_TRADE_UPDATE":
-		var orderUpdateEvent models.OrderUpdateEvent
-		if err := json.Unmarshal(message, &orderUpdateEvent); err != nil {
-			logger.S().Warnf("Could not unmarshal order trade update event: %v, Raw: %s", err, string(message))
+	switch baseEvent.EventType {
+	case "executionReport", "ORDER_TRADE_UPDATE":
+		var orderUpdate models.OrderUpdateEvent
+		if err := json.Unmarshal(message, &orderUpdate); err != nil {
+			logger.S().Warnf("Could not unmarshal order update event: %v", err)
 			return
 		}
-		// Instead of handling it directly, push it to the event channel
+		// Push the parsed event onto the central channel
 		b.eventChannel <- NormalizedEvent{
 			Type:      OrderUpdateEvent,
 			Timestamp: time.Now(),
-			Data:      orderUpdateEvent,
+			Data:      orderUpdate,
 		}
-	case "ACCOUNT_UPDATE":
-		// Placeholder for handling account updates if needed in the future.
-	case "TRADE_LITE":
-		// This is a public trade event, not specific to our orders. We can safely ignore it.
 	default:
-		// Optionally log unknown event types for future analysis, but avoid spamming.
+		// logger.S().Debugf("Ignoring WebSocket event type: %s", baseEvent.EventType)
 	}
 }
 
-// handleOrderUpdate is now called sequentially by the event processor.
+// handleOrderUpdate is the new central logic for processing order updates from the event channel.
 func (b *GridTradingBot) handleOrderUpdate(event models.OrderUpdateEvent) {
-	if event.Order.ExecutionType != "TRADE" || event.Order.Status != "FILLED" {
+	b.mutex.Lock()
+
+	var level *models.Level
+	var levelFound bool
+
+	// Find the corresponding level in our active grid
+	for i := range b.grid.GridLevels {
+		if b.grid.GridLevels[i].OrderID == event.Order.OrderID {
+			level = &b.grid.GridLevels[i]
+			levelFound = true
+			break
+		}
+	}
+
+	if !levelFound {
+		// This can happen for orders not part of our grid (e.g., initial position)
+		logger.S().Debugf("Received order update for order ID %d which is not in our active grid. Ignoring.", event.Order.OrderID)
+		b.mutex.Unlock()
 		return
 	}
 
-	o := event.Order
-	logger.S().Infof("--- Processing Order Fill Event ---")
-	logger.S().Infof("Order ID: %d, Symbol: %s, Side: %s, Price: %s, Quantity: %s, TradeID: %d",
-		o.OrderID, o.Symbol, o.Side, o.Price, o.ExecutedQty, o.TradeID)
+	logger.S().Infof("Processing update for GridID %d, OrderID %d. New Status: %s", level.GridID, level.OrderID, event.Order.ExecutionType)
+
+	switch event.Order.ExecutionType {
+	case "FILLED":
+		level.State = models.StateFilled
+		level.UpdatedAt = time.Now().Unix()
+		filledPrice, err := strconv.ParseFloat(event.Order.Price, 64)
+		if err != nil {
+			logger.S().Errorf("Could not parse fill price '%s' for order %d. Using last known price.", event.Order.Price, event.Order.OrderID)
+			filledPrice = b.grid.LastPrice // Fallback
+		}
+		b.grid.LastPrice = filledPrice
+		logger.S().Infof("✅ GRID-EVENT: %s FILLED at %.4f. GridID: %d", level.Side, filledPrice, level.GridID)
+
+		b.saveGridState()
+
+		// This is the core logic trigger for the moving grid. A fill requires a full grid rebuild.
+		b.mutex.Unlock() // IMPORTANT: Release lock before calling rebuild to prevent deadlock.
+		go func() {
+			if err := b.rebuildGrid(filledPrice); err != nil {
+				logger.S().Errorf("CRITICAL: Grid rebuild failed after fill: %v", err)
+				// The bot will enter safe mode inside rebuildGrid if it fails.
+			}
+		}()
+
+	case "CANCELED":
+		level.State = models.StateCancelled
+		level.UpdatedAt = time.Now().Unix()
+		logger.S().Infof("Order %d (GridID %d) confirmed as cancelled.", level.OrderID, level.GridID)
+		b.saveGridState()
+		b.mutex.Unlock()
+
+	case "NEW":
+		level.State = models.StateActive
+		level.UpdatedAt = time.Now().Unix()
+		logger.S().Infof("Order %d (GridID %d) confirmed as active.", level.OrderID, level.GridID)
+		b.saveGridState()
+		b.mutex.Unlock()
+
+	case "REJECTED":
+		level.State = models.StateError
+		level.UpdatedAt = time.Now().Unix()
+		logger.S().Errorf("Order %d (GridID %d) was REJECTED. Status: %s. Setting level to Error state.", level.OrderID, level.GridID, event.Order.Status)
+		b.saveGridState()
+		b.mutex.Unlock()
+
+	default:
+		// For statuses like "PARTIALLY_FILLED", "PENDING_CANCEL", etc., we just log and don't change state yet.
+		// The final state (FILLED, CANCELED) is what matters for our logic.
+		logger.S().Infof("Ignoring intermediate order status '%s' for order %d.", event.Order.ExecutionType, event.Order.OrderID)
+		b.mutex.Unlock()
+	}
+}
+
+// closeCurrentPosition is called when the reversion price is hit, to close the entire position.
+func (b *GridTradingBot) closeCurrentPosition() error {
+	logger.S().Warn("--- Reversion price hit! Closing current position. ---")
+	if err := b.cancelAllActiveOrders(); err != nil {
+		// Log the error but proceed to try and sell the position anyway
+		logger.S().Errorf("Failed to cancel all orders during position close: %v", err)
+	}
+
+	// Wait a moment for cancellations to process
+	time.Sleep(2 * time.Second)
 
 	b.mutex.Lock()
 	defer b.mutex.Unlock()
 
-	var triggeredLevel *models.Level
-	for i := range b.grid.ConceptualGrid {
-		if b.grid.ConceptualGrid[i].OrderID == o.OrderID {
-			triggeredLevel = &b.grid.ConceptualGrid[i]
-			break
-		}
-	}
-
-	if triggeredLevel == nil {
-		logger.S().Warnf("Received a fill for an unknown order ID: %d. Ignoring.", o.OrderID)
-		return
-	}
-
-	tradeIDStr := strconv.FormatInt(o.TradeID, 10)
-
-	// Idempotency Check: If we've already processed this trade, ignore.
-	if triggeredLevel.LastTradeID == tradeIDStr {
-		logger.S().Warnf("Received duplicate trade event for OrderID %d, TradeID %s. Ignoring.", o.OrderID, tradeIDStr)
-		return
-	}
-
-	// State Transition Check: Only process fills for active orders.
-	if triggeredLevel.State != models.StateActive {
-		logger.S().Warnf("Received fill for order %d which is not in Active state (current: %s). Ignoring.", o.OrderID, triggeredLevel.State)
-		return
-	}
-
-	logger.S().Infof(">>> Order Filled: %s at %.4f, GridID: %d <<<", triggeredLevel.Side, triggeredLevel.Price, triggeredLevel.GridID)
-
-	filledQty, err := strconv.ParseFloat(o.ExecutedQty, 64)
+	// Calculate total held assets (base currency)
+	// This is a simplified calculation. A more robust system would track this precisely.
+	totalQuantity, err := b.calculateTotalAssetQuantity()
 	if err != nil {
-		logger.S().Errorf("Could not parse last filled quantity for order %d: %v", o.OrderID, err)
-		return
+		return fmt.Errorf("could not calculate total asset quantity for closing position: %v", err)
 	}
 
-	triggeredLevel.State = models.StateFilled
-	triggeredLevel.FilledQuantity += filledQty
-	triggeredLevel.LastTradeID = tradeIDStr
-	triggeredLevel.UpdatedAt = time.Now().Unix()
+	if totalQuantity > 0 {
+		logger.S().Infof("Attempting to sell remaining %.8f of %s", totalQuantity, b.config.Symbol)
+		clientOrderID, err := b.generateClientOrderID()
+		if err != nil {
+			return fmt.Errorf("could not generate ID for closing order: %v", err)
+		}
+		_, err = b.exchange.PlaceOrder(b.config.Symbol, "SELL", "MARKET", totalQuantity, 0, clientOrderID)
+		if err != nil {
+			return fmt.Errorf("market sell to close position failed: %v", err)
+		}
+		logger.S().Info("Market sell order submitted to close position.")
+	} else {
+		logger.S().Info("No assets to sell, position already closed.")
+	}
+
+	// Mark the cycle as complete, ready for re-entry
+	b.basePositionEstablished = false
+	b.isReentering = true
+	b.grid = &models.Grid{Config: b.config} // Reset the grid
 	b.saveGridState()
 
-	// --- State Machine Transition Logic ---
-	var triggeredLevelIndex int = -1
-	for i := range b.grid.ConceptualGrid {
-		if &b.grid.ConceptualGrid[i] == triggeredLevel {
-			triggeredLevelIndex = i
-			break
-		}
-	}
-
-	if triggeredLevelIndex == -1 {
-		logger.S().Error("Internal inconsistency: triggeredLevel found but its index was not. Aborting state transition.")
-		return
-	}
-
-	// Check if the filled order is at the boundary of the grid
-	isTopHit := triggeredLevel.Side == models.Sell && triggeredLevelIndex == 0
-	isBottomHit := triggeredLevel.Side == models.Buy && triggeredLevelIndex == len(b.grid.ConceptualGrid)-1
-
-	if isTopHit || isBottomHit {
-		if isTopHit {
-			logger.S().Warnf(">>> TOP OF GRID HIT <<< Sell at Level %d filled. Triggering hard reset.", triggeredLevel.GridID)
-		}
-		if isBottomHit {
-			logger.S().Warnf(">>> BOTTOM OF GRID HIT <<< Buy at Level %d filled. Triggering hard reset.", triggeredLevel.GridID)
-		}
-		go b.hardReset()
-	} else {
-		// Standard operation: place the opposing order
-		if triggeredLevel.Side == models.Buy {
-			// Buy filled, place a sell one level higher (at a higher price, hence lower index)
-			targetIndex := triggeredLevelIndex - 1
-			if targetIndex >= 0 {
-				targetLevel := &b.grid.ConceptualGrid[targetIndex]
-				if targetLevel.State == models.StateIdle {
-					logger.S().Infof("Buy at Level %d filled. Placing Sell at adjacent Level %d.", triggeredLevel.GridID, targetLevel.GridID)
-					go b.placeAndManageOrder(models.Sell, targetLevel, nil)
-				}
-			}
-		} else { // Sell filled
-			// Sell filled, place a buy one level lower (at a lower price, hence higher index)
-			targetIndex := triggeredLevelIndex + 1
-			if targetIndex < len(b.grid.ConceptualGrid) {
-				targetLevel := &b.grid.ConceptualGrid[targetIndex]
-				if targetLevel.State == models.StateIdle {
-					logger.S().Infof("Sell at Level %d filled. Placing Buy at adjacent Level %d.", triggeredLevel.GridID, targetLevel.GridID)
-					go b.placeAndManageOrder(models.Buy, targetLevel, nil)
-				}
-			}
-		}
-	}
-}
-
-// hardReset orchestrates the full cycle of closing the position and re-entering the market.
-func (b *GridTradingBot) hardReset() {
-	logger.S().Warn("--- HARD RESET TRIGGERED ---")
-
-	b.mutex.Lock()
-	if b.isReentering {
-		logger.S().Warn("Hard reset is already in progress. Ignoring trigger.")
-		b.mutex.Unlock()
-		return
-	}
-	b.isReentering = true
-	b.mutex.Unlock()
-
-	defer func() {
-		b.mutex.Lock()
-		b.isReentering = false
-		b.mutex.Unlock()
-	}()
-
-	logger.S().Info("Hard Reset Step 1/3: Cancelling all active orders...")
-	if err := b.cancelAllActiveOrders(); err != nil {
-		b.enterSafeMode(fmt.Sprintf("Failed to cancel all orders during hard reset: %v", err))
-		return
-	}
-
-	time.Sleep(2 * time.Second)
-
-	logger.S().Info("Hard Reset Step 2/3: Closing current position...")
-	if err := b.closeCurrentPosition(); err != nil {
-		b.enterSafeMode(fmt.Sprintf("Failed to close position during hard reset: %v", err))
-		return
-	}
-
-	time.Sleep(5 * time.Second)
-
-	logger.S().Info("Hard Reset Step 3/3: Re-entering market with a new grid...")
-	if err := b.enterMarketAndSetupGrid(); err != nil {
-		b.enterSafeMode(fmt.Sprintf("Failed to re-enter market during hard reset: %v", err))
-		return
-	}
-
-	logger.S().Warn("--- HARD RESET COMPLETE ---")
-}
-
-// closeCurrentPosition closes the bot's current open position on the exchange by placing a market order.
-func (b *GridTradingBot) closeCurrentPosition() error {
-	logger.S().Info("--- Attempting to close current position ---")
-
-	positions, err := b.exchange.GetPositions(b.config.Symbol)
-	if err != nil {
-		return fmt.Errorf("could not get positions to close position: %v", err)
-	}
-
-	if len(positions) == 0 || positions[0].PositionAmt == "0" {
-		logger.S().Info("No open positions found or position is zero. Nothing to close.")
-		return nil
-	}
-
-	currentPositionSize, err := strconv.ParseFloat(positions[0].PositionAmt, 64)
-	if err != nil {
-		return fmt.Errorf("could not parse position amount '%s': %v", positions[0].PositionAmt, err)
-	}
-
-	if math.Abs(currentPositionSize) < 1e-9 {
-		logger.S().Info("Position size is effectively zero. Nothing to close.")
-		return nil
-	}
-
-	var side models.OrderSide
-	quantityToClose := math.Abs(currentPositionSize)
-
-	if currentPositionSize > 0 {
-		side = models.Sell
-	} else {
-		side = models.Buy
-	}
-
-	var stepSize string
-	for _, f := range b.symbolInfo.Filters {
-		if f.FilterType == "LOT_SIZE" {
-			stepSize = f.StepSize
-		}
-	}
-
-	adjustedQuantity := adjustValueToStep(quantityToClose, stepSize)
-	if adjustedQuantity == 0 && quantityToClose > 0 {
-		logger.S().Warnf("Position size %.8f is smaller than step size %s. Cannot place closing order.", quantityToClose, stepSize)
-		return nil
-	}
-
-	clientOrderID, err := b.generateClientOrderID()
-	if err != nil {
-		return fmt.Errorf("could not generate client order ID for closing order: %v", err)
-	}
-
-	logger.S().Infof("Placing MARKET %s order to close position of size %.8f.", side, adjustedQuantity)
-
-	_, err = b.exchange.PlaceOrder(b.config.Symbol, string(side), "MARKET", adjustedQuantity, 0, clientOrderID)
-	if err != nil {
-		return fmt.Errorf("failed to place market order to close position: %v", err)
-	}
-
-	logger.S().Info("Market order to close position has been submitted. Assuming it will fill shortly.")
+	logger.S().Info("--- Position closed. Bot is now in re-entry mode. ---")
 	return nil
 }
 
-// cancelAllActiveOrders iterates through the grid and cancels all orders in 'Active' state.
+// The final 'Cancelled' state is confirmed by the websocket event handler.
 func (b *GridTradingBot) cancelAllActiveOrders() error {
+	b.mutex.Lock()
 	logger.S().Info("Attempting to cancel all active orders...")
 
-	var ordersToCancel []*models.Level
-	b.mutex.RLock()
-	for i := range b.grid.ConceptualGrid {
-		level := &b.grid.ConceptualGrid[i]
-		if level.State == models.StateActive {
-			ordersToCancel = append(ordersToCancel, level)
+	var levelsToCancel []*models.Level
+	for i := range b.grid.GridLevels {
+		if b.grid.GridLevels[i].State == models.StateActive || b.grid.GridLevels[i].State == models.StatePlacing {
+			levelsToCancel = append(levelsToCancel, &b.grid.GridLevels[i])
 		}
 	}
-	b.mutex.RUnlock()
 
-	if len(ordersToCancel) == 0 {
+	if len(levelsToCancel) == 0 {
 		logger.S().Info("No active orders found to cancel.")
+		b.mutex.Unlock()
 		return nil
 	}
 
-	logger.S().Infof("Found %d active orders to cancel.", len(ordersToCancel))
+	logger.S().Infof("Found %d orders to cancel.", len(levelsToCancel))
+	b.mutex.Unlock() // Unlock before making network calls
 
-	var firstError error
-	for _, level := range ordersToCancel {
-		logger.S().Infof("Cancelling order %d for Level %d", level.OrderID, level.GridID)
-		err := b.exchange.CancelOrder(b.config.Symbol, level.OrderID)
-		if err != nil {
-			logger.S().Errorf("Failed to cancel order %d for Level %d: %v.", level.OrderID, level.GridID, err)
-			if firstError == nil {
-				firstError = err
+	var wg sync.WaitGroup
+	for _, level := range levelsToCancel {
+		wg.Add(1)
+		go func(l *models.Level) {
+			defer wg.Done()
+			logger.S().Infof("Cancelling order %d for Level %d...", l.OrderID, l.GridID)
+			err := b.exchange.CancelOrder(b.config.Symbol, l.OrderID)
+
+			b.mutex.Lock()
+			defer b.mutex.Unlock()
+
+			if err != nil {
+				// If cancellation fails, log it and set the state to Error.
+				// This requires manual intervention.
+				logger.S().Errorf("Failed to cancel order %d for Level %d: %v. Setting state to Error.", l.OrderID, l.GridID, err)
+				l.State = models.StateError
+			} else {
+				// The state is set to Cancelling. The final state (Cancelled) will be set
+				// by the order update event from the websocket.
+				l.State = models.StateCancelling
+				logger.S().Infof("Cancellation request for order %d (Level %d) sent successfully.", l.OrderID, l.GridID)
 			}
-		}
+		}(level)
 	}
 
-	if firstError != nil {
-		return fmt.Errorf("encountered one or more errors while cancelling orders: %w", firstError)
-	}
+	wg.Wait() // Wait for all cancellation requests to be sent
+	logger.S().Info("All cancellation requests have been sent.")
 
-	logger.S().Info("All active orders have been requested for cancellation.")
+	b.mutex.Lock()
+	b.saveGridState()
+	b.mutex.Unlock()
 	return nil
 }
 
-func (b *GridTradingBot) rebuildGrid(pivotLevelID int) error {
-	logger.S().Infof("--- Starting grid rebuild, pivot Level.GridID: %d ---", pivotLevelID)
+// rebuildGrid is the core logic for the "moving grid". It's triggered after a fill.
+// It cancels all orders, determines a new center price, and sets up a new grid.
+// For now, it re-uses the existing conceptual grid definition.
+func (b *GridTradingBot) rebuildGrid(pivotPrice float64) error {
+	logger.S().Info("--- Starting grid rebuild process ---")
+
+	// Step 1: Cancel all currently active orders.
+	logger.S().Info("Step 1/3: Cancelling all active orders...")
+	if err := b.cancelAllActiveOrders(); err != nil {
+		reason := fmt.Sprintf("failed to cancel all orders during rebuild: %v", err)
+		b.enterSafeMode(reason)
+		return errors.New(reason)
+	}
+	logger.S().Info("All active orders have been requested for cancellation. Waiting for confirmation via websocket...")
+	// In a real scenario, we'd wait for all CANCELED events. For simplicity here, we'll just sleep.
+	time.Sleep(2 * time.Second)
 
 	b.mutex.Lock()
 
-	// Step 1: Cancel all active orders
-	logger.S().Info("Step 1/3: Cancelling all active orders...")
-	for i := range b.grid.ConceptualGrid {
-		level := &b.grid.ConceptualGrid[i]
-		if level.State == models.StateActive {
-			logger.S().Infof("Cancelling order %d for Level %d", level.OrderID, level.GridID)
-			err := b.exchange.CancelOrder(b.config.Symbol, level.OrderID)
-			if err != nil {
-				logger.S().Errorf("Failed to cancel order %d for Level %d: %v. Setting state to Error.", level.OrderID, level.GridID, err)
-				level.State = models.StateError
-			} else {
-				level.State = models.StateCancelling
-				// In a real system, we'd wait for a websocket event to confirm cancellation.
-				// For this refactoring step, we'll assume it gets cancelled and update the state directly.
-				level.State = models.StateCancelled
-			}
-		}
-	}
-
 	// Step 2: Determine the new center price for the grid
-	logger.S().Info("Step 2/3: Determining new center price...")
-	var newCenterPrice float64
-	var pivotFound bool
-	for _, level := range b.grid.ConceptualGrid {
-		if level.GridID == pivotLevelID {
-			newCenterPrice = level.Price
-			pivotFound = true
-			break
-		}
-	}
+	logger.S().Info("Step 2/3: Using fill price as new center price...")
+	newCenterPrice := pivotPrice
+	logger.S().Infof("New center price will be the pivot fill price: %.4f", newCenterPrice)
 
-	if !pivotFound {
-		var err error
-		newCenterPrice, err = b.exchange.GetPrice(b.config.Symbol)
-		if err != nil {
-			b.mutex.Unlock() // Unlock before entering safe mode
-			reason := fmt.Sprintf("failed to get current price for full rebuild: %v", err)
-			b.enterSafeMode(reason)
-			return errors.New(reason)
-		}
-		logger.S().Infof("Pivot Level ID %d not found, using current market price %.4f as new center.", pivotLevelID, newCenterPrice)
-	} else {
-		logger.S().Infof("New center price will be based on pivot Level %d's price: %.4f", pivotLevelID, newCenterPrice)
-	}
-
-	// Step 3: Reset grid states and place new orders
+	// Step 3: Reset grid and place new orders
 	logger.S().Info("Step 3/3: Resetting grid and placing new orders...")
-	for i := range b.grid.ConceptualGrid {
-		level := &b.grid.ConceptualGrid[i]
-		if level.State != models.StateActive && level.State != models.StatePlacing {
-			level.State = models.StateIdle
-			level.OrderID = 0
-			level.ClientOrderID = ""
-		}
-	}
+	// The old grid levels are now all cancelled or cancelling. We can clear them.
+	b.grid.GridLevels = []models.Level{}
+	b.grid.LastPrice = newCenterPrice // Update last price
 
 	// IMPORTANT: Release the lock before calling setupInitialGrid to prevent deadlock,
 	// as setupInitialGrid will acquire its own lock.
@@ -881,346 +762,373 @@ func (b *GridTradingBot) rebuildGrid(pivotLevelID int) error {
 	return nil
 }
 
-// setupInitialGrid places the initial set of orders based on the established entry price.
-// It now only places sell orders above the entry price, as per the refined strategy.
-// It identifies which levels need orders and then places them sequentially using the thread-safe helper.
-func (b *GridTradingBot) setupInitialGrid(entryPrice float64) error {
-	logger.S().Info("--- Setting up initial grid orders ---")
+// setupInitialGrid creates and places the initial set of orders based on the conceptual grid.
+// In this new version, it creates the `Level` objects from the `ConceptualGrid` prices
+// and places both BUY and SELL orders around the given entry/center price.
+func (b *GridTradingBot) setupInitialGrid(centerPrice float64) error {
+	logger.S().Info("--- Setting up grid orders around new center price ---")
 
-	// Step 1: Identify levels that need sell orders, under a read lock.
-	b.mutex.RLock()
-	var levelsToOrder []*models.Level
-	for i := range b.grid.ConceptualGrid {
-		level := &b.grid.ConceptualGrid[i]
-		// Only place SELL orders above the final entry price.
-		if level.Price > entryPrice && level.State == models.StateIdle {
-			levelsToOrder = append(levelsToOrder, level)
+	b.mutex.Lock()
+
+	// Ensure GridLevels is empty before setup. This is crucial for rebuilds.
+	b.grid.GridLevels = []models.Level{}
+
+	// Step 1: Create Level objects from the conceptual grid prices.
+	for i, price := range b.grid.ConceptualGrid {
+		level := models.Level{
+			GridID:    i, // Use index as a simple unique ID for the level
+			Price:     price,
+			State:     models.StateIdle,
+			UpdatedAt: time.Now().Unix(),
+		}
+		b.grid.GridLevels = append(b.grid.GridLevels, level)
+	}
+
+	// Step 2: Identify which orders to place initially based on the new algorithm.
+	var wg sync.WaitGroup
+	var firstBuyLevelFound bool
+
+	// Unlock before spawning goroutines that will make blocking network calls.
+	// The goroutines themselves will handle locking for state changes.
+	b.mutex.Unlock()
+
+	// Place all sell orders for levels above the center price.
+	for i := range b.grid.GridLevels {
+		// We need to pass a copy of the level pointer to the goroutine
+		// to avoid race conditions on the loop variable.
+		level := &b.grid.GridLevels[i]
+		if level.Price > centerPrice {
+			wg.Add(1)
+			go b.placeAndManageOrder(models.Sell, level, &wg)
 		}
 	}
-	b.mutex.RUnlock()
 
-	// Step 2: Place orders sequentially for the identified levels.
-	// This is safer for initialization and easier to debug than concurrent placement.
-	// placeAndManageOrder is a blocking call, so this loop will execute them one by one.
-	ordersTriggered := 0
-	for _, level := range levelsToOrder {
-		// We are only placing Sells during the initial setup.
-		b.placeAndManageOrder(models.Sell, level, nil)
-		ordersTriggered++
+	// Place only the first buy order immediately below the center price.
+	// We iterate from the top (highest price) downwards to find the first suitable level.
+	for i := 0; i < len(b.grid.GridLevels); i++ {
+		level := &b.grid.GridLevels[i]
+		if level.Price < centerPrice && !firstBuyLevelFound {
+			wg.Add(1)
+			go b.placeAndManageOrder(models.Buy, level, &wg)
+			firstBuyLevelFound = true
+			break // Found the one and only buy order to place, so we can stop.
+		}
 	}
 
-	if ordersTriggered == 0 {
-		logger.S().Warn("No initial sell orders were placed. This might be expected if the entry price is above all grid levels.")
-	} else {
-		logger.S().Infof("--- Initial grid setup: %d sell orders triggered for placement ---", ordersTriggered)
+	if !firstBuyLevelFound {
+		logger.S().Warn("No suitable buy level found below the center price to place an initial order.")
 	}
+
+	logger.S().Info("Waiting for initial grid orders to be placed...")
+	wg.Wait() // Wait for all the spawned goroutines to complete.
+
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
+
+	b.saveGridState() // Save the newly populated grid state
+	logger.S().Info("Grid setup process finished.")
 	return nil
 }
 
-// enterSafeMode puts the bot into a safe mode where it stops trading
-func (b *GridTradingBot) enterSafeMode(reason string) {
-	b.mutex.Lock()
-	if b.isHalted {
-		b.mutex.Unlock()
-		return
-	}
-	b.isHalted = true
-	b.safeModeReason = reason
-	b.mutex.Unlock() // Unlock before logging and launching goroutine to avoid deadlocks
+// Run starts the main loop of the bot
+func (b *GridTradingBot) Run() {
+	logger.S().Info("Starting Grid Trading Bot...")
+	b.isRunning = true
 
-	logger.S().Errorf("--- Entering Safe Mode ---")
-	logger.S().Errorf("Reason: %s", reason)
-	logger.S().Errorf("Bot has stopped all trading activity. Manual intervention required.")
-
-	go func() {
-		if err := b.cancelAllActiveOrders(); err != nil {
-			logger.S().Errorf("Error during safe mode order cancellation: %v", err)
+	if err := b.loadGridState(); err != nil {
+		logger.S().Warnf("Could not load previous state: %v. Starting fresh.", err)
+		if err := b.enterMarketAndSetupGrid(); err != nil {
+			logger.S().Fatalf("Failed to perform initial market entry and grid setup: %v", err)
 		}
-	}()
-}
+	} else {
+		logger.S().Info("Successfully loaded previous state. Reconciling with exchange...")
+		if err := b.reconcileStateWithExchange(); err != nil {
+			b.enterSafeMode(fmt.Sprintf("Failed to reconcile state with exchange: %v", err))
+		}
+	}
 
-// eventProcessor is the heart of the bot, processing all events sequentially from a single channel.
-// This architectural choice eliminates race conditions for state modifications.
-func (b *GridTradingBot) eventProcessor() {
-	logger.S().Info("Core event processor started.")
+	if err := b.connectWebSocket(); err != nil {
+		logger.S().Fatalf("Failed to connect to WebSocket: %v", err)
+	}
+
+	if !b.IsBacktest {
+		go b.webSocketLoop()
+	}
+
+	// The main event processing loop
 	for {
 		select {
 		case event := <-b.eventChannel:
-			b.processSingleEvent(event)
+			if b.isHalted {
+				logger.S().Warnf("Bot is halted. Ignoring event type %d.", event.Type)
+				continue
+			}
+			switch event.Type {
+			case OrderUpdateEvent:
+				if orderUpdate, ok := event.Data.(models.OrderUpdateEvent); ok {
+					b.handleOrderUpdate(orderUpdate)
+				}
+			}
 		case <-b.stopChannel:
-			logger.S().Info("Core event processor stopped.")
+			logger.S().Info("Bot shutting down.")
+			b.isRunning = false
 			return
 		}
 	}
 }
 
-// processSingleEvent handles a single normalized event.
-// All state-modifying logic should be called from here.
-func (b *GridTradingBot) processSingleEvent(event NormalizedEvent) {
-	switch event.Type {
-	case OrderUpdateEvent:
-		if orderUpdate, ok := event.Data.(models.OrderUpdateEvent); ok {
-			b.handleOrderUpdate(orderUpdate)
-		} else {
-			logger.S().Warnf("Received OrderUpdateEvent with unexpected data type: %T", event.Data)
+// Stop gracefully stops the bot
+func (b *GridTradingBot) Stop() {
+	logger.S().Info("Stopping bot...")
+	if b.isRunning {
+		b.stopChannel <- true
+		if b.listenKey != "" {
+			b.exchange.CloseListenKey(b.listenKey)
 		}
-		// Future event types can be handled here
-		// case PriceTickEvent:
-		// ...
+		if b.wsConn != nil {
+			b.wsConn.Close()
+		}
+		b.saveGridState()
+		b.storage.Close()
 	}
 }
 
-// saveGridState is a helper function to persist the current grid state to the database.
-// It's designed to be called after any state-modifying operation.
+// saveGridState saves the current grid state to the persistent storage
 func (b *GridTradingBot) saveGridState() {
-	// The lock should already be held by the calling function, but a RLock is safe.
-	b.mutex.RLock()
-	defer b.mutex.RUnlock()
-
+	// This function is called from within locked sections, so no need to lock here.
 	if err := b.storage.SaveGrid(b.grid); err != nil {
-		logger.S().Errorf("--- FAILED TO SAVE GRID STATE: %v ---", err)
-		// In a real-world scenario, this might trigger a more drastic safety mechanism.
-	} else {
-		logger.S().Debug("Successfully saved grid state.")
+		logger.S().Errorf("Failed to save grid state: %v", err)
 	}
 }
 
-// reconcileStateWithExchange is called on startup to ensure the bot's internal state
-// matches the reality on the exchange.
-func (b *GridTradingBot) reconcileStateWithExchange() error {
+// loadGridState loads the grid state from the persistent storage
+func (b *GridTradingBot) loadGridState() error {
 	b.mutex.Lock()
 	defer b.mutex.Unlock()
-
-	logger.S().Info("Step 1/3: Fetching all open orders from exchange...")
-	openOrders, err := b.exchange.GetOpenOrders(b.config.Symbol)
+	grid, err := b.storage.LoadGrid()
 	if err != nil {
-		return fmt.Errorf("could not get open orders from exchange: %w", err)
+		return fmt.Errorf("could not load grid from storage: %v", err)
 	}
-	logger.S().Infof("Found %d open orders on the exchange.", len(openOrders))
-
-	// Create a map of open orders for efficient lookup by ClientOrderID.
-	ordersByClientOrderID := make(map[string]models.Order)
-	for _, order := range openOrders {
-		ordersByClientOrderID[order.ClientOrderId] = order
+	if grid == nil {
+		return errors.New("no saved grid found")
 	}
 
-	logger.S().Info("Step 2/3: Reconciling local grid levels with exchange orders...")
-	for i := range b.grid.ConceptualGrid {
-		level := &b.grid.ConceptualGrid[i]
-
-		// We only care about levels that we believe should have an active order.
-		if level.State != models.StateActive && level.State != models.StatePlacing {
-			continue
-		}
-
-		logger.S().Debugf("Reconciling Level %d (State: %s, ClientID: %s)", level.GridID, level.State, level.ClientOrderID)
-
-		order, found := ordersByClientOrderID[level.ClientOrderID]
-		if found {
-			// GOOD: The order exists on the exchange. Our state is likely consistent.
-			// Let's ensure our OrderID is aligned with the exchange's official ID.
-			if level.OrderID != order.OrderId {
-				logger.S().Warnf("Aligning OrderID for Level %d. Local: %d, Exchange: %d", level.GridID, level.OrderID, order.OrderId)
-				level.OrderID = order.OrderId
-			}
-			level.State = models.StateActive // Ensure state is Active, not Placing.
-			// Remove the order from the map so we can identify orphans later.
-			delete(ordersByClientOrderID, level.ClientOrderID)
-		} else {
-			// BAD: We think there's an order, but it's not on the exchange.
-			// It was likely filled or cancelled while we were offline.
-			logger.S().Warnf("DISCREPANCY: Level %d is %s locally, but no corresponding open order found on exchange (ClientID: %s).", level.GridID, level.State, level.ClientOrderID)
-
-			// To resolve, we should check the trade history for this order.
-			// This is a simplified approach for now: we reset the level to Idle.
-			// A more advanced implementation would query the order's final status.
-			level.State = models.StateIdle
-			level.OrderID = 0
-			// ClientOrderID is kept for historical reference, but the level is now available.
-		}
-	}
-
-	// Step 3/3: Handle any remaining "orphaned" orders on the exchange.
-	if len(ordersByClientOrderID) > 0 {
-		logger.S().Warnf("Found %d orphaned orders on the exchange that are not tracked locally. Cancelling them now...", len(ordersByClientOrderID))
-		for _, order := range ordersByClientOrderID {
-			logger.S().Infof("Cancelling orphaned order ID %d (ClientID: %s)...", order.OrderId, order.ClientOrderId)
-			if err := b.exchange.CancelOrder(b.config.Symbol, order.OrderId); err != nil {
-				// This is serious, as it could leave unwanted orders active.
-				logger.S().Errorf("CRITICAL: FAILED TO CANCEL ORPHANED ORDER ID %d: %v", order.OrderId, err)
-				// We might want to enter safe mode here.
-			}
-		}
-	} else {
-		logger.S().Info("No orphaned orders found on the exchange.")
-	}
-
-	// Finally, save the reconciled state.
-	b.saveGridState()
-
+	b.grid = grid
+	b.grid.Config = b.config // Re-link the config
+	logger.S().Info("Successfully loaded grid state.")
 	return nil
 }
 
-// adjustValueToStep adjusts a value to the given step size
-func adjustValueToStep(value float64, step string) float64 {
-	if step == "" || step == "0" {
-		return value
+// reconcileStateWithExchange compares the bot's state with the actual orders on the exchange
+func (b *GridTradingBot) reconcileStateWithExchange() error {
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
+	logger.S().Info("--- Starting state reconciliation with exchange ---")
+
+	openOrders, err := b.exchange.GetOpenOrders(b.config.Symbol)
+	if err != nil {
+		return fmt.Errorf("could not get open orders from exchange: %v", err)
 	}
-	stepFloat, err := strconv.ParseFloat(step, 64)
-	if err != nil || stepFloat == 0 {
-		return value
+
+	exchangeOrders := make(map[int64]models.Order)
+	for _, order := range openOrders {
+		exchangeOrders[order.OrderId] = order
 	}
-	multiplier := 1.0 / stepFloat
-	return math.Floor(value*multiplier) / multiplier
+
+	// We only reconcile levels that are supposed to be active
+	for i := range b.grid.GridLevels {
+		level := &b.grid.GridLevels[i]
+		if level.State == models.StateActive || level.State == models.StatePlacing {
+			if _, ok := exchangeOrders[level.OrderID]; ok {
+				// Order exists on both sides. Check for inconsistencies.
+				// For now, we assume the exchange is the source of truth.
+				// A more complex reconciliation could handle price/qty mismatches.
+				logger.S().Infof("Level %d (Order %d) is consistent with exchange.", level.GridID, level.OrderID)
+				level.State = models.StateActive // Ensure state is active
+				delete(exchangeOrders, level.OrderID)
+			} else {
+				// Order exists in our state but not on the exchange. It might have been filled or cancelled.
+				logger.S().Warnf("Order %d for Level %d exists in state but not on exchange. Assuming filled/cancelled.", level.OrderID, level.GridID)
+				level.State = models.StateFilled // A safe assumption to trigger rebuild or be ignored
+			}
+		}
+	}
+
+	// Any remaining orders in exchangeOrders are "orphaned" - they exist on the exchange but not in our state.
+	if len(exchangeOrders) > 0 {
+		logger.S().Warnf("Found %d orphaned orders on the exchange. Attempting to cancel them.", len(exchangeOrders))
+		for _, order := range exchangeOrders {
+			logger.S().Warnf("Cancelling orphaned order ID %d", order.OrderId)
+			b.exchange.CancelOrder(b.config.Symbol, order.OrderId)
+		}
+	}
+
+	b.saveGridState()
+	logger.S().Info("--- Reconciliation finished ---")
+	return nil
 }
 
-// generateClientOrderID generates a new client order ID
+// enterSafeMode halts all trading activity due to a critical error
+func (b *GridTradingBot) enterSafeMode(reason string) {
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
+	if b.isHalted {
+		return
+	}
+	b.isHalted = true
+	b.safeModeReason = reason
+	logger.S().Errorf("CRITICAL ERROR: Entering safe mode. Reason: %s", reason)
+	logger.S().Error("All trading activities are halted. Manual intervention is required.")
+	// Optionally, cancel all orders when entering safe mode
+	// b.cancelAllActiveOrders() // Be careful with locking if you enable this
+}
+
+// isWithinExposureLimit checks if adding a certain quantity would exceed the wallet exposure limit
+func (b *GridTradingBot) isWithinExposureLimit(quantityToAdd float64) bool {
+	if b.config.WalletExposureLimit <= 0 {
+		return true // Limit is disabled
+	}
+
+	// This is a simplified calculation. A real implementation would need to
+	// fetch the current balance of the base asset.
+	// For now, we estimate the current exposure based on our grid.
+	currentPosition, err := b.calculateTotalAssetQuantity()
+	if err != nil {
+		logger.S().Errorf("Could not calculate current position for exposure check: %v", err)
+		return false // Fail safe
+	}
+
+	return (currentPosition + quantityToAdd) <= b.config.WalletExposureLimit
+}
+
+// calculateTotalAssetQuantity estimates the total quantity of the base asset held.
+// This is a simplified estimation based on the number of filled buy vs sell orders.
+func (b *GridTradingBot) calculateTotalAssetQuantity() (float64, error) {
+	// This function is called from within locked sections.
+
+	// Start with the initial position
+	sellGridCount := 0
+	for _, price := range b.grid.ConceptualGrid {
+		if price > b.grid.EntryPrice {
+			sellGridCount++
+		}
+	}
+	singleGridQuantity, err := b.calculateQuantity(b.grid.EntryPrice)
+	if err != nil {
+		return 0, err
+	}
+	totalQuantity := float64(sellGridCount) * singleGridQuantity
+
+	// Adjust based on filled grid orders
+	for _, level := range b.grid.GridLevels {
+		if level.State == models.StateFilled {
+			if level.Side == models.Buy {
+				totalQuantity += singleGridQuantity
+			} else if level.Side == models.Sell {
+				totalQuantity -= singleGridQuantity
+			}
+		}
+	}
+
+	return totalQuantity, nil
+}
+
+// generateClientOrderID creates a new unique client order ID
 func (b *GridTradingBot) generateClientOrderID() (string, error) {
+	// The new Generate method returns a formatted string directly.
 	id, err := b.idGenerator.Generate()
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("x-grid-%s", id), nil
+	return id, nil
 }
 
-// isWithinExposureLimit checks if adding a trade would exceed the wallet exposure limit
-func (b *GridTradingBot) isWithinExposureLimit(quantityToAdd float64) bool {
-	b.mutex.RLock()
-	defer b.mutex.RUnlock()
-
-	if b.config.WalletExposureLimit <= 0 {
-		return true
+// adjustValueToStep adjusts a value to match the required step size for the exchange
+func adjustValueToStep(value float64, step string) float64 {
+	stepFloat, err := strconv.ParseFloat(step, 64)
+	if err != nil || stepFloat == 0 {
+		return value // Cannot adjust if step is invalid
 	}
-
-	positions, err := b.exchange.GetPositions(b.config.Symbol)
-	if err != nil {
-		logger.S().Warnf("Could not get positions to check exposure limit: %v", err)
-		return false
-	}
-
-	var currentPositionSize float64
-	if len(positions) > 0 {
-		currentPositionSize, _ = strconv.ParseFloat(positions[0].PositionAmt, 64)
-	}
-
-	_, accountEquity, err := b.exchange.GetAccountState(b.config.Symbol)
-	if err != nil {
-		logger.S().Warnf("Could not get account state to check exposure limit: %v", err)
-		return false
-	}
-
-	if accountEquity <= 0 {
-		return false
-	}
-
-	futurePositionValue := (currentPositionSize + quantityToAdd) * b.currentPrice
-	expectedExposure := futurePositionValue / accountEquity
-
-	if expectedExposure > b.config.WalletExposureLimit {
-		logger.S().Warnf(
-			"Wallet exposure check failed: Expected exposure %.2f%% would exceed limit of %.2f%%.",
-			expectedExposure*100, b.config.WalletExposureLimit*100,
-		)
-		return false
-	}
-	return true
+	return math.Floor(value/stepFloat) * stepFloat
 }
 
-// Start is the main entry point for the live trading bot.
-func (b *GridTradingBot) Start() error {
-	logger.S().Info("--- Starting Grid Trading Bot ---")
-
-	// Step 1: Load grid state from storage
-	loadedGrid, err := b.storage.LoadGrid()
-	if err != nil {
-		if errors.Is(err, models.ErrStateNotFound) {
-			logger.S().Info("No previous state found. Starting with a fresh grid.")
-			// This is not an error, we just start fresh.
-		} else {
-			return fmt.Errorf("failed to load grid state: %w", err)
-		}
-	} else if loadedGrid != nil {
-		b.grid = loadedGrid
-		logger.S().Info("Successfully loaded grid state from database.")
-
-		// Step 2: Reconcile state with the exchange
-		if err := b.reconcileStateWithExchange(); err != nil {
-			b.enterSafeMode(fmt.Sprintf("Failed to reconcile state with exchange: %v", err))
-			return err
-		}
-	}
-
-	// Step 3: If the grid is empty (fresh start), set it up.
-	if len(b.grid.ConceptualGrid) == 0 {
-		if err := b.enterMarketAndSetupGrid(); err != nil {
-			return fmt.Errorf("failed to perform initial market entry and grid setup: %w", err)
-		}
-	}
-
-	// Step 4: Connect to WebSocket and start listening for events.
-	if err := b.connectWebSocket(); err != nil {
-		return fmt.Errorf("failed to connect to WebSocket: %w", err)
-	}
-
-	b.isRunning = true
-	go b.webSocketLoop()
-	go b.eventProcessor()
-
-	logger.S().Info("--- Grid Trading Bot is now running ---")
-	return nil
-}
-
-// Stop gracefully shuts down the bot.
-func (b *GridTradingBot) Stop() {
-	logger.S().Info("--- Stopping Grid Trading Bot ---")
-	b.mutex.Lock()
-	if !b.isRunning {
-		b.mutex.Unlock()
-		logger.S().Info("Bot is not running.")
+// BacktestTick simulates a single tick of time in backtesting mode
+func (b *GridTradingBot) BacktestTick(price float64, timestamp time.Time) {
+	if !b.IsBacktest {
 		return
 	}
-	b.isRunning = false
+
+	b.mutex.Lock()
+	b.currentPrice = price
+	b.currentTime = timestamp
 	b.mutex.Unlock()
 
-	close(b.stopChannel) // Signal all goroutines to stop
-
-	if b.wsConn != nil {
-		b.wsConn.Close()
-	}
-	if b.storage != nil {
-		b.storage.Close()
-	}
-	logger.S().Info("--- Bot has been stopped ---")
+	// Simulate order fills
+	b.checkPriceCrossings(price)
 }
 
-// StartForBacktest prepares the bot for a backtest run.
-func (b *GridTradingBot) StartForBacktest() error {
-	logger.S().Info("--- Initializing Bot for Backtest ---")
-	// In backtesting, we always start with a fresh grid.
-	if err := b.enterMarketAndSetupGrid(); err != nil {
-		return fmt.Errorf("failed to perform initial market entry for backtest: %w", err)
+// checkPriceCrossings simulates order fills by checking if the current price has crossed any grid levels.
+func (b *GridTradingBot) checkPriceCrossings(currentPrice float64) {
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
+
+	for i := range b.grid.GridLevels {
+		level := &b.grid.GridLevels[i]
+		if level.State != models.StateActive {
+			continue
+		}
+
+		crossed := false
+		if level.Side == models.Buy && currentPrice <= level.Price {
+			crossed = true
+		} else if level.Side == models.Sell && currentPrice >= level.Price {
+			crossed = true
+		}
+
+		if crossed {
+			logger.S().Infof("[BACKTEST] Price of %.4f crossed level %d (%s @ %.4f). Simulating fill.", currentPrice, level.GridID, level.Side, level.Price)
+			// Simulate a fill event and push it to the channel
+			// In a real backtest, you'd generate a more complete event object.
+			orderUpdate := models.OrderUpdateEvent{
+				EventType: "executionReport",
+				Order: models.OrderUpdateInfo{
+					ExecutionType: "FILLED",
+					OrderID:       level.OrderID,
+					ClientOrderID: level.ClientOrderID,
+					Symbol:        b.config.Symbol,
+					Side:          string(level.Side),
+					Price:         strconv.FormatFloat(level.Price, 'f', -1, 64),
+					Status:        "FILLED",
+				},
+			}
+			// Use a goroutine to avoid deadlock on the event channel if it's full
+			go func() {
+				b.eventChannel <- NormalizedEvent{
+					Type:      OrderUpdateEvent,
+					Timestamp: b.currentTime,
+					Data:      orderUpdate,
+				}
+			}()
+		}
 	}
-	b.isRunning = true
-	logger.S().Info("--- Backtest Bot Initialized ---")
+}
+
+// Start 在一个新的 goroutine 中启动机器人。
+func (b *GridTradingBot) Start() error {
+	b.logger.Info("启动实时交易机器人...")
+	go b.Run()
 	return nil
 }
 
-// SetCurrentPrice updates the bot's current price view, for backtesting purposes.
-func (b *GridTradingBot) SetCurrentPrice(price float64) {
-	b.mutex.Lock()
-	defer b.mutex.Unlock()
-	b.currentPrice = price
+// StartForBacktest 在当前 goroutine 中启动机器人，用于回测。
+func (b *GridTradingBot) StartForBacktest() error {
+	b.logger.Info("启动回测机器人...")
+	// 在回测模式下，我们直接在当前 goroutine 运行，以便按顺序处理历史数据
+	b.Run()
+	return nil
 }
 
-// ProcessBacktestTick simulates a single tick of market data for backtesting.
-func (b *GridTradingBot) ProcessBacktestTick() {
-	// In a real backtest, this would trigger the same logic as the live event processor.
-	// For this refactoring, we assume the backtest exchange will create and push events.
-	// The core logic is now unified in the event processor.
-	// We can simulate price-crossing checks here if needed, but for now, we rely on the exchange mock.
-}
-
-// IsHalted returns true if the bot is in a safe mode.
+// IsHalted 返回机器人是否已暂停。
 func (b *GridTradingBot) IsHalted() bool {
 	b.mutex.RLock()
 	defer b.mutex.RUnlock()
