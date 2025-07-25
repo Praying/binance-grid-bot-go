@@ -198,7 +198,7 @@ func (e *LiveExchange) GetPositions(symbol string) ([]models.Position, error) {
 }
 
 // PlaceOrder 下单。
-func (e *LiveExchange) PlaceOrder(symbol, side, orderType string, quantity, price float64, clientOrderID string) (*models.Order, error) {
+func (e *LiveExchange) PlaceOrder(symbol, side, orderType string, quantity float64, price string, clientOrderID string) (*models.Order, error) {
 	params := url.Values{}
 	params.Set("symbol", symbol)
 	params.Set("side", side)
@@ -207,7 +207,7 @@ func (e *LiveExchange) PlaceOrder(symbol, side, orderType string, quantity, pric
 
 	if orderType == "LIMIT" {
 		params.Set("timeInForce", "GTC") // Good Till Cancel
-		params.Set("price", fmt.Sprintf("%f", price))
+		params.Set("price", price)
 	}
 	if clientOrderID != "" {
 		params.Set("newClientOrderId", clientOrderID)
@@ -561,4 +561,21 @@ func (e *LiveExchange) ConnectWebSocket(listenKey string) (*websocket.Conn, erro
 	}
 	e.wsConn = conn
 	return conn, nil
+}
+
+// GetOrderBookTicker 获取指定交易对的最新订单簿报价。
+func (e *LiveExchange) GetOrderBookTicker(symbol string) (*models.BookTicker, error) {
+	params := url.Values{}
+	params.Set("symbol", symbol)
+	data, err := e.doRequest("GET", "/fapi/v1/ticker/bookTicker", params, false)
+	if err != nil {
+		return nil, err
+	}
+
+	var ticker models.BookTicker
+	if err := json.Unmarshal(data, &ticker); err != nil {
+		return nil, err
+	}
+
+	return &ticker, nil
 }

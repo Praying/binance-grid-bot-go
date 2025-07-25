@@ -106,6 +106,7 @@ type Order struct {
 	TimeInForce   string `json:"timeInForce"`
 	Type          string `json:"type"`
 	Side          string `json:"side"`
+	AvgPrice      string `json:"avgPrice"`
 	StopPrice     string `json:"stopPrice"`
 	IcebergQty    string `json:"icebergQty"`
 	Time          int64  `json:"time"`
@@ -385,4 +386,13 @@ type PositionUpdate struct {
 	IsolatedWallet      string `json:"iw"`  // 逐仓钱包余额
 	PositionSide        string `json:"ps"`  // 持仓方向 (BOTH, LONG, SHORT)
 	BreakEvenPrice      string `json:"bep"` // 盈亏平衡价
+}
+
+// BookTicker represents the best price/qty on the order book for a symbol.
+type BookTicker struct {
+	Symbol      string `json:"symbol"`
+	BidPrice    string `json:"bidPrice"`
+	BidQuantity string `json:"bidQty"`
+	AskPrice    string `json:"askPrice"`
+	AskQuantity string `json:"askQty"`
 }

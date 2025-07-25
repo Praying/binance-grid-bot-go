@@ -22,7 +22,7 @@ type NewOrderRequest struct {
 type Exchange interface {
 	GetPrice(symbol string) (float64, error)
 	GetPositions(symbol string) ([]models.Position, error)
-	PlaceOrder(symbol, side, orderType string, quantity, price float64, clientOrderID string) (*models.Order, error)
+	PlaceOrder(symbol, side, orderType string, quantity float64, price string, clientOrderID string) (*models.Order, error)
 	CancelOrder(symbol string, orderID int64) error
 	SetLeverage(symbol string, leverage int) error
 	SetPositionMode(isHedgeMode bool) error
@@ -39,6 +39,7 @@ type Exchange interface {
 	GetOpenOrders(symbol string) ([]models.Order, error) // 新增：获取所有挂单
 	GetServerTime() (int64, error)                       // 新增：获取服务器时间
 	GetLastTrade(symbol string, orderID int64) (*models.Trade, error)
+	GetOrderBookTicker(symbol string) (*models.BookTicker, error)
 	GetMaxWalletExposure() float64
 	CreateListenKey() (string, error)
 	KeepAliveListenKey(listenKey string) error

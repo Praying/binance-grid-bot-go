@@ -19,7 +19,7 @@
   "retry_attempts": 5,
   "retry_initial_delay_ms": 1000,
   "log": {
-  	"level": "info",
+  	"level": "debug",
   	"output": "both",
   	"file": "logs/grid-bot.log",
   	"max_size": 10,

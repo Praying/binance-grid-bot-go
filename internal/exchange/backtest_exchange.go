@@ -401,7 +401,7 @@ func (e *BacktestExchange) GetPrice(symbol string) (float64, error) {
 	return e.CurrentPrice, nil
 }
 
-func (e *BacktestExchange) PlaceOrder(symbol, side, orderType string, quantity, price float64, clientOrderID string) (*models.Order, error) {
+func (e *BacktestExchange) PlaceOrder(symbol, side, orderType string, quantity float64, price string, clientOrderID string) (*models.Order, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -412,14 +412,14 @@ func (e *BacktestExchange) PlaceOrder(symbol, side, orderType string, quantity, 
 		Side:          side,
 		Type:          orderType,
 		OrigQty:       fmt.Sprintf("%.8f", quantity),
-		Price:         fmt.Sprintf("%.8f", price),
+		Price:         price,
 		Status:        "NEW",
 	}
 	e.orders[order.OrderId] = order
 	e.NextOrderID++
 
 	if orderType == "MARKET" {
-		order.Price = fmt.Sprintf("%.8f", e.CurrentPrice)
+		order.Price = strconv.FormatFloat(e.CurrentPrice, 'f', -1, 64)
 		e.handleFilledOrder(order)
 	} else if orderType == "LIMIT" {
 		// 立即用当前价格检查这个新的限价单是否可以被撮合
@@ -641,4 +641,23 @@ func (e *BacktestExchange) ConnectWebSocket(listenKey string) (*websocket.Conn, 
 // CloseListenKey 在回测中是一个空操作，因为没有真实的 WebSocket 连接。
 func (e *BacktestExchange) CloseListenKey(listenKey string) error {
 	return nil
+}
+
+// GetOrderBookTicker 为回测提供一个模拟实现。
+// 它返回一个基于当前模拟价格的固定价差的模拟订单簿报价。
+func (e *BacktestExchange) GetOrderBookTicker(symbol string) (*models.BookTicker, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	// 模拟一个小的买卖价差
+	askPrice := e.CurrentPrice * 1.0005
+	bidPrice := e.CurrentPrice * 0.9995
+
+	return &models.BookTicker{
+		Symbol:      symbol,
+		AskPrice:    strconv.FormatFloat(askPrice, 'f', -1, 64),
+		AskQuantity: "100", // 模拟一个合理的数量
+		BidPrice:    strconv.FormatFloat(bidPrice, 'f', -1, 64),
+		BidQuantity: "100", // 模拟一个合理的数量
+	}, nil
 }

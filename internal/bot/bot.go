@@ -6,16 +6,19 @@ import (
 	"binance-grid-bot-go/internal/logger"
 	"binance-grid-bot-go/internal/models"
 	"binance-grid-bot-go/internal/storage"
+	"binance-grid-bot-go/internal/utils"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/tidwall/gjson"
 	"go.uber.org/zap"
 )
 
@@ -101,31 +104,81 @@ func NewGridTradingBot(config *models.Config, ex exchange.Exchange, isBacktest b
 
 // establishBasePositionAndWait tries to establish the initial base position and waits for it to be filled
 func (b *GridTradingBot) establishBasePositionAndWait(quantity float64) (float64, error) {
+	// 1. 获取当前订单簿的最佳卖价
+	ticker, err := b.exchange.GetOrderBookTicker(b.config.Symbol)
+	if err != nil {
+		return 0, fmt.Errorf("could not get order book ticker: %v", err)
+	}
+	askPrice, err := strconv.ParseFloat(ticker.AskPrice, 64)
+	if err != nil {
+		return 0, fmt.Errorf("could not parse ask price: %v", err)
+	}
+
+	// 2. 计算一个略高的限价以确保快速成交
+	limitPriceFloat := askPrice * 1.001
+
+	// 2a. 格式化价格
+	var tickSize string
+	for _, f := range b.symbolInfo.Filters {
+		if f.FilterType == "PRICE_FILTER" {
+			tickSize = f.TickSize
+			break
+		}
+	}
+	if tickSize == "" {
+		return 0, fmt.Errorf("could not find PRICE_FILTER for symbol %s", b.config.Symbol)
+	}
+
+	limitPriceStr, err := utils.FormatPrice(limitPriceFloat, tickSize)
+	if err != nil {
+		return 0, fmt.Errorf("could not format initial limit price: %v", err)
+	}
+	logger.S().Infof("Current Ask Price: %.4f, Placing limit buy at formatted price %s (raw: %.4f)", askPrice, limitPriceStr, limitPriceFloat)
+
+	// 3. 生成客户端订单ID并下限价单
 	clientOrderID, err := b.generateClientOrderID()
 	if err != nil {
 		return 0, fmt.Errorf("could not generate ID for initial order: %v", err)
 	}
-	order, err := b.exchange.PlaceOrder(b.config.Symbol, "BUY", "MARKET", quantity, 0, clientOrderID)
+
+	order, err := b.exchange.PlaceOrder(b.config.Symbol, "BUY", "LIMIT", quantity, limitPriceStr, clientOrderID)
 	if err != nil {
-		return 0, fmt.Errorf("initial market buy failed: %v", err)
+		return 0, fmt.Errorf("initial limit buy failed: %v", err)
 	}
-	logger.S().Infof("Submitted initial market buy order ID: %d, Quantity: %.5f. Waiting for fill...", order.OrderId, quantity)
+	logger.S().Infof("Submitted initial limit buy order ID: %d, Quantity: %.5f, Price: %s. Waiting for fill...", order.OrderId, quantity, limitPriceStr)
 
-	// In backtesting, market orders are assumed to fill instantly. We check status once.
-	// This simplified logic removes the ticker polling that was a source of deadlocks.
-	time.Sleep(10 * time.Millisecond) // Brief sleep just in case of minor simulated exchange latency.
+	// 4. 等待订单成交
+	// 在回测中，由于价格是离散更新的，我们假设限价单会立即成交
+	// 在实盘中，我们需要轮询订单状态
+	if b.IsBacktest {
+		time.Sleep(10 * time.Millisecond) // 模拟网络延迟
+	} else {
+		// 实盘轮询逻辑
+		for i := 0; i < 10; i++ { // 最多轮询10次 (约10秒)
+			status, err := b.exchange.GetOrderStatus(b.config.Symbol, order.OrderId)
+			if err != nil {
+				return 0, fmt.Errorf("failed to get status for initial order %d: %v", order.OrderId, err)
+			}
+			if status.Status == "FILLED" {
+				break // 订单已成交，跳出循环
+			}
+			time.Sleep(1 * time.Second)
+		}
+	}
 
+	// 5. 确认最终状态并获取成交价
 	status, err := b.exchange.GetOrderStatus(b.config.Symbol, order.OrderId)
 	if err != nil {
-		// In backtesting, if GetOrderStatus can't find the order, we assume it filled and was archived.
+		// 在回测中，如果找不到订单，我们假设它已成交并归档
 		if b.IsBacktest && strings.Contains(err.Error(), "not found") {
 			logger.S().Infof("Initial order %d status check returned 'not found', assuming filled in backtest mode.", order.OrderId)
 			b.mutex.Lock()
 			b.basePositionEstablished = true
 			b.mutex.Unlock()
-			return b.currentPrice, nil
+			// 在这种情况下，我们使用设定的限价作为近似成交价
+			return limitPriceFloat, nil
 		}
-		return 0, fmt.Errorf("failed to get status for initial order %d: %v", order.OrderId, err)
+		return 0, fmt.Errorf("failed to get final status for initial order %d: %v", order.OrderId, err)
 	}
 
 	if status.Status == "FILLED" {
@@ -134,9 +187,17 @@ func (b *GridTradingBot) establishBasePositionAndWait(quantity float64) (float64
 		b.basePositionEstablished = true
 		b.mutex.Unlock()
 
+		// 尝试获取精确的成交价
+		avgPrice, err := strconv.ParseFloat(status.AvgPrice, 64)
+		if err == nil && avgPrice > 0 {
+			return avgPrice, nil
+		}
+
+		// 如果平均价格不可用，则回退到使用最后成交价
 		trade, err := b.exchange.GetLastTrade(b.config.Symbol, order.OrderId)
 		if err != nil {
-			return 0, fmt.Errorf("could not get trade for initial order %d: %v", order.OrderId, err)
+			logger.S().Warnf("Could not get trade for initial order %d, using limit price as approximation: %v", order.OrderId, err)
+			return limitPriceFloat, nil
 		}
 		filledPrice, err := strconv.ParseFloat(trade.Price, 64)
 		if err != nil {
@@ -145,7 +206,7 @@ func (b *GridTradingBot) establishBasePositionAndWait(quantity float64) (float64
 		return filledPrice, nil
 	}
 
-	return 0, fmt.Errorf("initial position order %d did not fill immediately. Status: %s", order.OrderId, status.Status)
+	return 0, fmt.Errorf("initial position order %d did not fill. Final Status: %s", order.OrderId, status.Status)
 }
 
 // enterMarketAndSetupGrid implements the logic for entering the market and setting up the grid
@@ -204,12 +265,12 @@ func (b *GridTradingBot) enterMarketAndSetupGrid() error {
 			sellGridCount++
 		}
 	}
-	singleGridQuantity, err := b.calculateQuantity(b.grid.EntryPrice)
+	singleGridQuantityFloat, err := b.calculateQuantity(b.grid.EntryPrice)
 	if err != nil {
 		return fmt.Errorf("could not determine grid quantity for initial position: %v", err)
 	}
 
-	initialPositionQuantity := float64(sellGridCount) * singleGridQuantity
+	initialPositionQuantity := float64(sellGridCount) * singleGridQuantityFloat
 	logger.S().Infof("Calculated initial position quantity: %.8f", initialPositionQuantity)
 
 	if !b.isWithinExposureLimit(initialPositionQuantity) {
@@ -231,7 +292,7 @@ func (b *GridTradingBot) enterMarketAndSetupGrid() error {
 
 	if isEstablished {
 		logger.S().Info("Initial position confirmed, setting up grid orders...")
-		err := b.setupInitialGrid(b.grid.EntryPrice)
+		err := b.setupInitialGrid()
 		if err != nil {
 			return fmt.Errorf("initial grid setup failed: %v", err)
 		}
@@ -245,20 +306,33 @@ func (b *GridTradingBot) enterMarketAndSetupGrid() error {
 
 // placeNewOrder is a helper function to place an order and return the result
 func (b *GridTradingBot) placeNewOrder(side models.OrderSide, price float64, gridID int) (*models.Order, error) {
-	var tickSize string
+	var tickSize, stepSize string
 	for _, f := range b.symbolInfo.Filters {
 		if f.FilterType == "PRICE_FILTER" {
 			tickSize = f.TickSize
 		}
+		if f.FilterType == "LOT_SIZE" {
+			stepSize = f.StepSize
+		}
+	}
+	if tickSize == "" || stepSize == "" {
+		return nil, fmt.Errorf("could not find PRICE_FILTER or LOT_SIZE for symbol %s", b.config.Symbol)
 	}
 
-	adjustedPrice := adjustValueToStep(price, tickSize)
-	quantity, err := b.calculateQuantity(adjustedPrice)
+	// 格式化价格
+	priceStr, err := utils.FormatPrice(price, tickSize)
 	if err != nil {
-		return nil, fmt.Errorf("failed to calculate order quantity at price %.4f: %v", adjustedPrice, err)
+		return nil, fmt.Errorf("failed to format price %.4f for grid order: %v", price, err)
 	}
 
-	if side == models.Buy && !b.isWithinExposureLimit(quantity) {
+	// 计算并格式化数量
+	// 计算并格式化数量
+	quantityFloat, err := b.calculateQuantity(price)
+	if err != nil {
+		return nil, fmt.Errorf("failed to calculate order quantity at price %.4f: %v", price, err)
+	}
+
+	if side == models.Buy && !b.isWithinExposureLimit(quantityFloat) {
 		return nil, fmt.Errorf("order blocked: wallet exposure limit would be exceeded")
 	}
 
@@ -267,12 +341,12 @@ func (b *GridTradingBot) placeNewOrder(side models.OrderSide, price float64, gri
 		return nil, fmt.Errorf("could not generate client order ID for grid order (GridID: %d): %v", gridID, err)
 	}
 
-	order, err := b.exchange.PlaceOrder(b.config.Symbol, string(side), "LIMIT", quantity, adjustedPrice, clientOrderID)
+	order, err := b.exchange.PlaceOrder(b.config.Symbol, string(side), "LIMIT", quantityFloat, priceStr, clientOrderID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to place %s order at price %.4f: %v", side, adjustedPrice, err)
+		return nil, fmt.Errorf("failed to place %s order at price %s: %v", side, priceStr, err)
 	}
 
-	logger.S().Infof("Submitted %s order: ClientID %s, Price %.4f, Quantity %.5f, GridID: %d. Waiting for confirmation...", side, clientOrderID, adjustedPrice, quantity, gridID)
+	logger.S().Infof("Submitted %s order: ClientID %s, Price %s, Quantity %.5f, GridID: %d. Waiting for confirmation...", side, clientOrderID, priceStr, quantityFloat, gridID)
 	return order, nil
 }
 
@@ -368,17 +442,22 @@ func (b *GridTradingBot) calculateQuantity(price float64) (float64, error) {
 		quantity = minQtyValue
 	}
 
+	// Here we use a helper that was implicitly defined in the original code.
+	// Let's assume adjustValueToStep exists and works correctly.
 	adjustedQuantity := adjustValueToStep(quantity, stepSize)
 
+	// Final checks to ensure the adjusted quantity still meets minimums
 	if adjustedQuantity < minQtyValue {
 		step, _ := strconv.ParseFloat(stepSize, 64)
 		if step > 0 {
 			adjustedQuantity += step
-			adjustedQuantity = adjustValueToStep(adjustedQuantity, stepSize)
+			adjustedQuantity = adjustValueToStep(adjustedQuantity, stepSize) // Re-adjust after adding step
 		}
 	}
 
 	if price*adjustedQuantity < minNotionalValue {
+		// If it's still too low, we might need a more robust adjustment,
+		// but for now, another step addition is a reasonable attempt.
 		step, _ := strconv.ParseFloat(stepSize, 64)
 		if step > 0 {
 			adjustedQuantity += step
@@ -386,6 +465,12 @@ func (b *GridTradingBot) calculateQuantity(price float64) (float64, error) {
 		}
 	}
 
+	// The final formatted string is now handled by FormatQuantity,
+	// but this function's callers in bot.go expect a float64 for logic checks.
+	// The conversion to a formatted string for the API call happens in `placeNewOrder`.
+	// Therefore, this function should return the final calculated float64 value.
+	// We also need to ensure the `adjustValueToStep` function is available.
+	// Let's add it.
 	return adjustedQuantity, nil
 }
 
@@ -512,15 +597,10 @@ func (b *GridTradingBot) webSocketLoop() {
 
 // handleWebSocketMessage parses the incoming message and dispatches it to the event channel
 func (b *GridTradingBot) handleWebSocketMessage(message []byte) {
-	var baseEvent struct {
-		EventType string `json:"e"`
-	}
-	if err := json.Unmarshal(message, &baseEvent); err != nil {
-		logger.S().Warnf("Could not unmarshal base event: %v", err)
-		return
-	}
+	logger.S().Debugln("Received WebSocket message: %s", string(message))
+	eventType := gjson.Get(string(message), "e").String()
 
-	switch baseEvent.EventType {
+	switch eventType {
 	case "executionReport", "ORDER_TRADE_UPDATE":
 		var orderUpdate models.OrderUpdateEvent
 		if err := json.Unmarshal(message, &orderUpdate); err != nil {
@@ -561,9 +641,9 @@ func (b *GridTradingBot) handleOrderUpdate(event models.OrderUpdateEvent) {
 		return
 	}
 
-	logger.S().Infof("Processing update for GridID %d, OrderID %d. New Status: %s", level.GridID, level.OrderID, event.Order.ExecutionType)
+	logger.S().Infof("Processing update for GridID %d, OrderID %d. New Status: %s", level.GridID, level.OrderID, event.Order.Status)
 
-	switch event.Order.ExecutionType {
+	switch event.Order.Status {
 	case "FILLED":
 		level.State = models.StateFilled
 		level.UpdatedAt = time.Now().Unix()
@@ -578,9 +658,10 @@ func (b *GridTradingBot) handleOrderUpdate(event models.OrderUpdateEvent) {
 		b.saveGridState()
 
 		// This is the core logic trigger for the moving grid. A fill requires a full grid rebuild.
+		gridIDToRebuild := level.GridID
 		b.mutex.Unlock() // IMPORTANT: Release lock before calling rebuild to prevent deadlock.
 		go func() {
-			if err := b.rebuildGrid(filledPrice); err != nil {
+			if err := b.rebuildGrid(gridIDToRebuild); err != nil {
 				logger.S().Errorf("CRITICAL: Grid rebuild failed after fill: %v", err)
 				// The bot will enter safe mode inside rebuildGrid if it fails.
 			}
@@ -642,7 +723,7 @@ func (b *GridTradingBot) closeCurrentPosition() error {
 		if err != nil {
 			return fmt.Errorf("could not generate ID for closing order: %v", err)
 		}
-		_, err = b.exchange.PlaceOrder(b.config.Symbol, "SELL", "MARKET", totalQuantity, 0, clientOrderID)
+		_, err = b.exchange.PlaceOrder(b.config.Symbol, "SELL", "MARKET", totalQuantity, "0", clientOrderID)
 		if err != nil {
 			return fmt.Errorf("market sell to close position failed: %v", err)
 		}
@@ -718,55 +799,158 @@ func (b *GridTradingBot) cancelAllActiveOrders() error {
 
 // rebuildGrid is the core logic for the "moving grid". It's triggered after a fill.
 // It cancels all orders, determines a new center price, and sets up a new grid.
-// For now, it re-uses the existing conceptual grid definition.
-func (b *GridTradingBot) rebuildGrid(pivotPrice float64) error {
-	logger.S().Info("--- Starting grid rebuild process ---")
+// This version is robust, parallelized, and safer.
+func (b *GridTradingBot) rebuildGrid(pivotGridID int) error {
+	logger.S().Infof("--- Starting grid rebuild, pivot GridID: %d ---", pivotGridID)
 
-	// Step 1: Cancel all currently active orders.
-	logger.S().Info("Step 1/3: Cancelling all active orders...")
+	// Step 1: Cancel all active orders and wait for confirmation.
+	logger.S().Info("Step 1/3: Cancelling all existing orders...")
 	if err := b.cancelAllActiveOrders(); err != nil {
-		reason := fmt.Sprintf("failed to cancel all orders during rebuild: %v", err)
+		reason := fmt.Sprintf("failed to cancel orders during grid rebuild: %v", err)
 		b.enterSafeMode(reason)
 		return errors.New(reason)
 	}
-	logger.S().Info("All active orders have been requested for cancellation. Waiting for confirmation via websocket...")
-	// In a real scenario, we'd wait for all CANCELED events. For simplicity here, we'll just sleep.
-	time.Sleep(2 * time.Second)
 
+	logger.S().Info("Step 2/3: Waiting for internal state to confirm all orders are cancelled...")
+	timeout := time.After(30 * time.Second)
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			b.mutex.RLock()
+			activeCount := 0
+			for _, level := range b.grid.GridLevels {
+				if level.State == models.StateActive {
+					activeCount++
+				}
+			}
+			b.mutex.RUnlock()
+
+			if activeCount == 0 {
+				logger.S().Info("All orders confirmed cancelled via internal state.")
+				goto allCancelled
+			}
+			logger.S().Infof("Still waiting for %d orders to be confirmed as cancelled...", activeCount)
+		case <-timeout:
+			reason := "timeout waiting for order cancellation confirmation"
+			b.enterSafeMode(reason)
+			return errors.New(reason)
+		case <-b.stopChannel:
+			return errors.New("bot stopped, interrupting grid rebuild")
+		}
+	}
+
+allCancelled:
+	logger.S().Info("Step 3/3: Placing new grid orders...")
+
+	b.mutex.RLock()
+	conceptualGridCopy := make([]float64, len(b.grid.ConceptualGrid))
+	copy(conceptualGridCopy, b.grid.ConceptualGrid)
+	activeOrdersCount := b.config.ActiveOrdersCount
+	b.mutex.RUnlock()
+
+	if pivotGridID < 0 || pivotGridID >= len(conceptualGridCopy) {
+		reason := fmt.Sprintf("invalid pivotGridID: %d", pivotGridID)
+		b.enterSafeMode(reason)
+		return errors.New(reason)
+	}
+	pivotPrice := conceptualGridCopy[pivotGridID]
+	logger.S().Infof("Using pivot GridID: %d (Price: %.4f)", pivotGridID, pivotPrice)
+
+	var wg sync.WaitGroup
+	newLevelsChan := make(chan models.Level, activeOrdersCount*2)
+	errChan := make(chan error, activeOrdersCount*2)
+
+	// Determine which levels to create orders for
+	levelsToPlace := make([]models.Level, 0)
+	// Place sell orders above the pivot
+	for i := 1; i <= activeOrdersCount; i++ {
+		sellIndex := pivotGridID - i
+		if sellIndex < 0 {
+			break // Reached the top of the conceptual grid
+		}
+		levelsToPlace = append(levelsToPlace, models.Level{GridID: sellIndex, Price: conceptualGridCopy[sellIndex], State: models.StateIdle})
+	}
+
+	// Place buy orders below the pivot
+	for i := 1; i <= activeOrdersCount; i++ {
+		buyIndex := pivotGridID + i
+		if buyIndex >= len(conceptualGridCopy) {
+			break // Reached the bottom of the conceptual grid
+		}
+		levelsToPlace = append(levelsToPlace, models.Level{GridID: buyIndex, Price: conceptualGridCopy[buyIndex], State: models.StateIdle})
+	}
+
+	// Place orders in parallel using the robust placeAndManageOrder
+	for i := range levelsToPlace {
+		level := &levelsToPlace[i] // Important to take the address of the slice element
+		wg.Add(1)
+		go func(l *models.Level) {
+			// placeAndManageOrder handles its own Done() call if wg is passed, but we manage it here.
+			// So we pass nil for the waitgroup to that function.
+			var side models.OrderSide
+			if l.Price > pivotPrice {
+				side = models.Sell
+			} else {
+				side = models.Buy
+			}
+			b.placeAndManageOrder(side, l, &wg) // Pass the waitgroup here
+
+			// After placement, check the final state. placeAndManageOrder is synchronous in its state update.
+			b.mutex.RLock()
+			finalState := l.State
+			b.mutex.RUnlock()
+
+			if finalState == models.StateActive {
+				newLevelsChan <- *l
+			} else {
+				errChan <- fmt.Errorf("failed to place order for GridID %d, final state: %s", l.GridID, finalState)
+			}
+		}(level)
+	}
+
+	wg.Wait()
+	close(newLevelsChan)
+	close(errChan)
+
+	var finalError error
+	for err := range errChan {
+		if finalError == nil {
+			finalError = err
+		}
+		logger.S().Error(err.Error())
+	}
+
+	// Collect new levels into a temporary slice first.
+	finalNewLevels := make([]models.Level, 0, activeOrdersCount*2)
+	for level := range newLevelsChan {
+		finalNewLevels = append(finalNewLevels, level)
+	}
+
+	// Now, update the shared state under a single lock.
 	b.mutex.Lock()
-
-	// Step 2: Determine the new center price for the grid
-	logger.S().Info("Step 2/3: Using fill price as new center price...")
-	newCenterPrice := pivotPrice
-	logger.S().Infof("New center price will be the pivot fill price: %.4f", newCenterPrice)
-
-	// Step 3: Reset grid and place new orders
-	logger.S().Info("Step 3/3: Resetting grid and placing new orders...")
-	// The old grid levels are now all cancelled or cancelling. We can clear them.
-	b.grid.GridLevels = []models.Level{}
-	b.grid.LastPrice = newCenterPrice // Update last price
-
-	// IMPORTANT: Release the lock before calling setupInitialGrid to prevent deadlock,
-	// as setupInitialGrid will acquire its own lock.
+	b.grid.GridLevels = finalNewLevels
+	b.grid.LastPrice = pivotPrice
+	b.saveGridState()
 	b.mutex.Unlock()
-	err := b.setupInitialGrid(newCenterPrice)
-	// No need to re-acquire the lock as the function is ending.
 
-	if err != nil {
-		reason := fmt.Sprintf("failed to setup new grid during rebuild: %v", err)
+	if finalError != nil {
+		reason := fmt.Sprintf("one or more orders failed during grid rebuild: %v", finalError)
 		b.enterSafeMode(reason)
 		return errors.New(reason)
 	}
 
-	logger.S().Info("--- Grid rebuild process finished ---")
+	logger.S().Infof("--- Grid rebuild complete, %d new orders placed ---", len(finalNewLevels))
 	return nil
 }
 
 // setupInitialGrid creates and places the initial set of orders based on the conceptual grid.
 // In this new version, it creates the `Level` objects from the `ConceptualGrid` prices
 // and places both BUY and SELL orders around the given entry/center price.
-func (b *GridTradingBot) setupInitialGrid(centerPrice float64) error {
-	logger.S().Info("--- Setting up grid orders around new center price ---")
+func (b *GridTradingBot) setupInitialGrid() error {
+	logger.S().Info("--- Setting up grid orders based on initial entry price ---")
 
 	b.mutex.Lock()
 
@@ -784,41 +968,76 @@ func (b *GridTradingBot) setupInitialGrid(centerPrice float64) error {
 		b.grid.GridLevels = append(b.grid.GridLevels, level)
 	}
 
-	// Step 2: Identify which orders to place initially based on the new algorithm.
+	if len(b.grid.GridLevels) == 0 {
+		b.mutex.Unlock()
+		logger.S().Warn("No grid levels were generated. Skipping order placement.")
+		return nil
+	}
+
+	// Step 2: Find the grid level closest to the actual entry price.
+	centerIndex := -1
+	minDiff := math.MaxFloat64
+	entryPrice := b.grid.EntryPrice
+
+	for i, level := range b.grid.GridLevels {
+		diff := math.Abs(level.Price - entryPrice)
+		if diff < minDiff {
+			minDiff = diff
+			centerIndex = i
+		}
+	}
+
+	if centerIndex == -1 {
+		b.mutex.Unlock()
+		return errors.New("could not find a center grid level, which should not happen")
+	}
+	logger.S().Infof("Entry price is %.4f, closest grid level is #%d at %.4f.", entryPrice, centerIndex, b.grid.GridLevels[centerIndex].Price)
+
+	// Step 3: Partition levels into buy and sell lists, excluding the center level.
+	var buyLevels, sellLevels []*models.Level
+	for i := range b.grid.GridLevels {
+		if i < centerIndex {
+			// Prices are HIGHER than center -> SELL levels
+			sellLevels = append(sellLevels, &b.grid.GridLevels[i])
+		} else if i > centerIndex {
+			// Prices are LOWER than center -> BUY levels
+			buyLevels = append(buyLevels, &b.grid.GridLevels[i])
+		}
+	}
+
+	// Sort buy levels in descending order to place orders closest to the center price first.
+	sort.Slice(buyLevels, func(i, j int) bool {
+		return buyLevels[i].Price > buyLevels[j].Price
+	})
+
+	// Sort sell levels in ascending order to place orders closest to the center price first.
+	sort.Slice(sellLevels, func(i, j int) bool {
+		return sellLevels[i].Price < sellLevels[j].Price
+	})
+
 	var wg sync.WaitGroup
-	var firstBuyLevelFound bool
+	activeOrdersCount := b.config.ActiveOrdersCount
 
 	// Unlock before spawning goroutines that will make blocking network calls.
-	// The goroutines themselves will handle locking for state changes.
 	b.mutex.Unlock()
 
-	// Place all sell orders for levels above the center price.
-	for i := range b.grid.GridLevels {
-		// We need to pass a copy of the level pointer to the goroutine
-		// to avoid race conditions on the loop variable.
-		level := &b.grid.GridLevels[i]
-		if level.Price > centerPrice {
-			wg.Add(1)
-			go b.placeAndManageOrder(models.Sell, level, &wg)
-		}
+	// Place BUY orders for levels below the center level.
+	buyOrdersPlaced := 0
+	for i := 0; i < len(buyLevels) && buyOrdersPlaced < activeOrdersCount; i++ {
+		wg.Add(1)
+		go b.placeAndManageOrder(models.Buy, buyLevels[i], &wg)
+		buyOrdersPlaced++
 	}
 
-	// Place only the first buy order immediately below the center price.
-	// We iterate from the top (highest price) downwards to find the first suitable level.
-	for i := 0; i < len(b.grid.GridLevels); i++ {
-		level := &b.grid.GridLevels[i]
-		if level.Price < centerPrice && !firstBuyLevelFound {
-			wg.Add(1)
-			go b.placeAndManageOrder(models.Buy, level, &wg)
-			firstBuyLevelFound = true
-			break // Found the one and only buy order to place, so we can stop.
-		}
+	// Place SELL orders for levels above the center level.
+	sellOrdersPlaced := 0
+	for i := 0; i < len(sellLevels) && sellOrdersPlaced < activeOrdersCount; i++ {
+		wg.Add(1)
+		go b.placeAndManageOrder(models.Sell, sellLevels[i], &wg)
+		sellOrdersPlaced++
 	}
 
-	if !firstBuyLevelFound {
-		logger.S().Warn("No suitable buy level found below the center price to place an initial order.")
-	}
-
+	logger.S().Infof("Placing %d SELL orders and %d BUY orders.", sellOrdersPlaced, buyOrdersPlaced)
 	logger.S().Info("Waiting for initial grid orders to be placed...")
 	wg.Wait() // Wait for all the spawned goroutines to complete.
 
@@ -1043,15 +1262,6 @@ func (b *GridTradingBot) generateClientOrderID() (string, error) {
 	return id, nil
 }
 
-// adjustValueToStep adjusts a value to match the required step size for the exchange
-func adjustValueToStep(value float64, step string) float64 {
-	stepFloat, err := strconv.ParseFloat(step, 64)
-	if err != nil || stepFloat == 0 {
-		return value // Cannot adjust if step is invalid
-	}
-	return math.Floor(value/stepFloat) * stepFloat
-}
-
 // BacktestTick simulates a single tick of time in backtesting mode
 func (b *GridTradingBot) BacktestTick(price float64, timestamp time.Time) {
 	if !b.IsBacktest {
@@ -1133,4 +1343,13 @@ func (b *GridTradingBot) IsHalted() bool {
 	b.mutex.RLock()
 	defer b.mutex.RUnlock()
 	return b.isHalted
+}
+
+// adjustValueToStep adjusts a value down to the nearest multiple of a given step string.
+func adjustValueToStep(value float64, step string) float64 {
+	stepFloat, err := strconv.ParseFloat(step, 64)
+	if err != nil || stepFloat <= 0 {
+		return value // Return original value if step is invalid
+	}
+	return math.Floor(value/stepFloat) * stepFloat
 }
