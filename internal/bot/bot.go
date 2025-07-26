@@ -11,7 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -864,14 +863,14 @@ allCancelled:
 	errChan := make(chan error, activeOrdersCount*2)
 
 	// Determine which levels to create orders for
-	levelsToPlace := make([]models.Level, 0)
+	levelsToPlace := make([]models.Level, 0, activeOrdersCount)
 	// Place sell orders above the pivot
 	for i := 1; i <= activeOrdersCount; i++ {
 		sellIndex := pivotGridID - i
 		if sellIndex < 0 {
 			break // Reached the top of the conceptual grid
 		}
-		levelsToPlace = append(levelsToPlace, models.Level{GridID: sellIndex, Price: conceptualGridCopy[sellIndex], State: models.StateIdle})
+		levelsToPlace = append(levelsToPlace, models.Level{GridID: sellIndex, Side: models.Sell, Price: conceptualGridCopy[sellIndex], State: models.StateIdle})
 	}
 
 	// Place buy orders below the pivot
@@ -880,7 +879,7 @@ allCancelled:
 		if buyIndex >= len(conceptualGridCopy) {
 			break // Reached the bottom of the conceptual grid
 		}
-		levelsToPlace = append(levelsToPlace, models.Level{GridID: buyIndex, Price: conceptualGridCopy[buyIndex], State: models.StateIdle})
+		levelsToPlace = append(levelsToPlace, models.Level{GridID: buyIndex, Side: models.Buy, Price: conceptualGridCopy[buyIndex], State: models.StateIdle})
 	}
 
 	// Place orders in parallel using the robust placeAndManageOrder
@@ -890,13 +889,7 @@ allCancelled:
 		go func(l *models.Level) {
 			// placeAndManageOrder handles its own Done() call if wg is passed, but we manage it here.
 			// So we pass nil for the waitgroup to that function.
-			var side models.OrderSide
-			if l.Price > pivotPrice {
-				side = models.Sell
-			} else {
-				side = models.Buy
-			}
-			b.placeAndManageOrder(side, l, &wg) // Pass the waitgroup here
+			b.placeAndManageOrder(l.Side, l, &wg) // Pass the waitgroup here
 
 			// After placement, check the final state. placeAndManageOrder is synchronous in its state update.
 			b.mutex.RLock()
@@ -991,59 +984,51 @@ func (b *GridTradingBot) setupInitialGrid() error {
 		b.mutex.Unlock()
 		return errors.New("could not find a center grid level, which should not happen")
 	}
+	b.mutex.Unlock()
+
 	logger.S().Infof("Entry price is %.4f, closest grid level is #%d at %.4f.", entryPrice, centerIndex, b.grid.GridLevels[centerIndex].Price)
 
 	// Step 3: Partition levels into buy and sell lists, excluding the center level.
-	var buyLevels, sellLevels []*models.Level
-	for i := range b.grid.GridLevels {
-		if i < centerIndex {
-			// Prices are HIGHER than center -> SELL levels
-			sellLevels = append(sellLevels, &b.grid.GridLevels[i])
-		} else if i > centerIndex {
-			// Prices are LOWER than center -> BUY levels
-			buyLevels = append(buyLevels, &b.grid.GridLevels[i])
+	pivotGridID := centerIndex
+	activeOrdersCount := b.config.ActiveOrdersCount
+	conceptualGridCopy := make([]float64, len(b.grid.ConceptualGrid))
+	copy(conceptualGridCopy, b.grid.ConceptualGrid)
+	levelsToPlace := make([]models.Level, 0, activeOrdersCount)
+	// Place sell orders above the pivot
+	for i := 1; i <= activeOrdersCount; i++ {
+		sellIndex := pivotGridID - i
+		if sellIndex < 0 {
+			break // Reached the top of the conceptual grid
+		}
+		levelsToPlace = append(levelsToPlace, models.Level{GridID: sellIndex, Side: models.Sell, Price: conceptualGridCopy[sellIndex], State: models.StateIdle})
+	}
+
+	// Place buy orders below the pivot
+	for i := 1; i <= activeOrdersCount; i++ {
+		buyIndex := pivotGridID + i
+		if buyIndex >= len(conceptualGridCopy) {
+			break // Reached the bottom of the conceptual grid
+		}
+		levelsToPlace = append(levelsToPlace, models.Level{GridID: buyIndex, Side: models.Buy, Price: conceptualGridCopy[buyIndex], State: models.StateIdle})
+	}
+
+	// Place orders in parallel using the robust placeAndManageOrder
+	sellOrdersPlaced := 0
+	buyOrdersPlaced := 0
+
+	for i := range levelsToPlace {
+		level := &levelsToPlace[i]                    // Important to take the address of the slice element
+		b.placeAndManageOrder(level.Side, level, nil) // Pass the waitgroup here
+		if level.Side == models.Sell {
+			sellOrdersPlaced++
+		} else {
+			buyOrdersPlaced++
 		}
 	}
-
-	// Sort buy levels in descending order to place orders closest to the center price first.
-	sort.Slice(buyLevels, func(i, j int) bool {
-		return buyLevels[i].Price > buyLevels[j].Price
-	})
-
-	// Sort sell levels in ascending order to place orders closest to the center price first.
-	sort.Slice(sellLevels, func(i, j int) bool {
-		return sellLevels[i].Price < sellLevels[j].Price
-	})
-
-	var wg sync.WaitGroup
-	activeOrdersCount := b.config.ActiveOrdersCount
-
-	// Unlock before spawning goroutines that will make blocking network calls.
-	b.mutex.Unlock()
-
-	// Place BUY orders for levels below the center level.
-	buyOrdersPlaced := 0
-	for i := 0; i < len(buyLevels) && buyOrdersPlaced < activeOrdersCount; i++ {
-		wg.Add(1)
-		go b.placeAndManageOrder(models.Buy, buyLevels[i], &wg)
-		buyOrdersPlaced++
-	}
-
-	// Place SELL orders for levels above the center level.
-	sellOrdersPlaced := 0
-	for i := 0; i < len(sellLevels) && sellOrdersPlaced < activeOrdersCount; i++ {
-		wg.Add(1)
-		go b.placeAndManageOrder(models.Sell, sellLevels[i], &wg)
-		sellOrdersPlaced++
-	}
-
 	logger.S().Infof("Placing %d SELL orders and %d BUY orders.", sellOrdersPlaced, buyOrdersPlaced)
 	logger.S().Info("Waiting for initial grid orders to be placed...")
-	wg.Wait() // Wait for all the spawned goroutines to complete.
-
 	b.mutex.Lock()
 	defer b.mutex.Unlock()
-
 	b.saveGridState() // Save the newly populated grid state
 	logger.S().Info("Grid setup process finished.")
 	return nil
