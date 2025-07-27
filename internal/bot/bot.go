@@ -655,16 +655,13 @@ func (b *GridTradingBot) handleOrderUpdate(event models.OrderUpdateEvent) {
 		logger.S().Infof("✅ GRID-EVENT: %s FILLED at %.4f. GridID: %d", level.Side, filledPrice, level.GridID)
 
 		b.saveGridState()
-
 		// This is the core logic trigger for the moving grid. A fill requires a full grid rebuild.
 		gridIDToRebuild := level.GridID
 		b.mutex.Unlock() // IMPORTANT: Release lock before calling rebuild to prevent deadlock.
-		go func() {
-			if err := b.rebuildGrid(gridIDToRebuild); err != nil {
-				logger.S().Errorf("CRITICAL: Grid rebuild failed after fill: %v", err)
-				// The bot will enter safe mode inside rebuildGrid if it fails.
-			}
-		}()
+		if err := b.rebuildGrid(gridIDToRebuild); err != nil {
+			logger.S().Errorf("CRITICAL: Grid rebuild failed after fill: %v", err)
+			// The bot will enter safe mode inside rebuildGrid if it fails.
+		}
 
 	case "CANCELED":
 		level.State = models.StateCancelled
@@ -818,15 +815,12 @@ func (b *GridTradingBot) rebuildGrid(pivotGridID int) error {
 	for {
 		select {
 		case <-ticker.C:
-			b.mutex.RLock()
 			activeCount := 0
 			for _, level := range b.grid.GridLevels {
 				if level.State == models.StateActive {
 					activeCount++
 				}
 			}
-			b.mutex.RUnlock()
-
 			if activeCount == 0 {
 				logger.S().Info("All orders confirmed cancelled via internal state.")
 				goto allCancelled
