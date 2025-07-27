@@ -757,36 +757,35 @@ func (b *GridTradingBot) cancelAllActiveOrders() error {
 	}
 
 	logger.S().Infof("Found %d orders to cancel.", len(levelsToCancel))
-	b.mutex.Unlock() // Unlock before making network calls
+	// Unlock is handled within the loop now for synchronous execution
+	b.mutex.Unlock()
 
-	var wg sync.WaitGroup
+	// Synchronously cancel each order
 	for _, level := range levelsToCancel {
-		wg.Add(1)
-		go func(l *models.Level) {
-			defer wg.Done()
-			logger.S().Infof("Cancelling order %d for Level %d...", l.OrderID, l.GridID)
-			err := b.exchange.CancelOrder(b.config.Symbol, l.OrderID)
+		logger.S().Infof("Cancelling order %d for Level %d...", level.OrderID, level.GridID)
+		// We perform the network call outside the main lock
+		err := b.exchange.CancelOrder(b.config.Symbol, level.OrderID)
 
-			b.mutex.Lock()
-			defer b.mutex.Unlock()
-
-			if err != nil {
-				// If cancellation fails, log it and set the state to Error.
-				// This requires manual intervention.
-				logger.S().Errorf("Failed to cancel order %d for Level %d: %v. Setting state to Error.", l.OrderID, l.GridID, err)
-				l.State = models.StateError
-			} else {
-				// The state is set to Cancelling. The final state (Cancelled) will be set
-				// by the order update event from the websocket.
-				l.State = models.StateCancelling
-				logger.S().Infof("Cancellation request for order %d (Level %d) sent successfully.", l.OrderID, l.GridID)
-			}
-		}(level)
+		// Re-lock to safely update the level's state
+		b.mutex.Lock()
+		if err != nil {
+			// If cancellation fails, log it and set the state to Error.
+			// This requires manual intervention.
+			logger.S().Errorf("Failed to cancel order %d for Level %d: %v. Setting state to Error.", level.OrderID, level.GridID, err)
+			level.State = models.StateError
+		} else {
+			// The state is set to Cancelling. The final state (Cancelled) will be set
+			// by the order update event from the websocket.
+			level.State = models.StateCancelling
+			logger.S().Infof("Cancellation request for order %d (Level %d) sent successfully.", level.OrderID, level.GridID)
+		}
+		// Unlock after each update
+		b.mutex.Unlock()
 	}
 
-	wg.Wait() // Wait for all cancellation requests to be sent
 	logger.S().Info("All cancellation requests have been sent.")
 
+	// Final lock to save the updated grid state
 	b.mutex.Lock()
 	b.saveGridState()
 	b.mutex.Unlock()
