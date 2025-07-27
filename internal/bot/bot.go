@@ -924,7 +924,9 @@ allCancelled:
 
 	// Now, update the shared state under a single lock.
 	b.mutex.Lock()
-	b.grid.GridLevels = finalNewLevels
+	for _, level := range finalNewLevels {
+		b.grid.GridLevels[level.GridID] = level
+	}
 	b.grid.LastPrice = pivotPrice
 	b.saveGridState()
 	b.mutex.Unlock()
@@ -1019,6 +1021,11 @@ func (b *GridTradingBot) setupInitialGrid() error {
 	for i := range levelsToPlace {
 		level := &levelsToPlace[i]                    // Important to take the address of the slice element
 		b.placeAndManageOrder(level.Side, level, nil) // Pass the waitgroup here
+		if level.State == models.StateActive {
+			b.grid.GridLevels[level.GridID] = *level
+		} else {
+			logger.S().Errorf("failed to place order for GridID %d, final state: %s", level.GridID, level.State)
+		}
 		if level.Side == models.Sell {
 			sellOrdersPlaced++
 		} else {
