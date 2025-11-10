@@ -5,7 +5,7 @@ go 1.23
 require (
 	github.com/adshao/go-binance/v2 v2.8.5
 	github.com/gorilla/websocket v1.5.3
-	github.com/jedib0t/go-pretty/v6 v6.6.9
+	github.com/jedib0t/go-pretty/v6 v6.7.1
 	github.com/joho/godotenv v1.5.1
 	github.com/jxskiss/base62 v1.1.0
 	go.uber.org/zap v1.27.0
