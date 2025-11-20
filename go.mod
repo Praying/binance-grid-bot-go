@@ -8,7 +8,7 @@ require (
 	github.com/jedib0t/go-pretty/v6 v6.6.9
 	github.com/joho/godotenv v1.5.1
 	github.com/jxskiss/base62 v1.1.0
-	go.uber.org/zap v1.27.0
+	go.uber.org/zap v1.27.1
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 )
 
